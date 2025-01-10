@@ -5732,15 +5732,188 @@ class STAR(HamiltonLiquidHandler):
 
   # -------------- 3.11.1 Initialization --------------
 
+  async def initialize_384_head(
+    self,
+    x_position: int = 0,
+    x_direction: int = 0,
+    y_position: int = 5640,
+    z_deposit_position: int = 3270,
+    z_position_at_command_end: int = 3270,
+  ):
+    """Initialize 384 Head
+
+    Initialize CoRe 384 Head. Dependent to configuration initialization change.
+
+    Args:
+      x_position: X-Position [0.1mm] of well A1. Must be between 0 and 30000. Default 0.
+      x_direction: X-direction. 0 = positive 1 = negative. Must be between 0 and 1. Default 0.
+      y_position: Y-Position [0.1mm] (discard position of tip A1 ). Must be between 1100 and 5640.
+        Default 5640.
+      z_deposit_position_[0.1mm]: Z- deposit position [0.1mm] (collar bearing position). Must be
+        between 0 and 3270. Default 3270.
+      z_position_at_command_end: Z-Position at the command end [0.1mm]. Must be between 0 and
+        3270. Default 3270.
+
+    """
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= z_deposit_position <= 3270, "z_deposit_position must be between 0 and 3270"
+    assert (
+      0 <= z_position_at_command_end <= 3270
+    ), "z_position_at_command_end must be between 0 and 3270"
+
+    return await self.send_command(
+      module="C0",
+      command="JI",
+      xs=f"{x_position:05}",
+      xd=x_direction,
+      yk=f"{y_position:04}",
+      je=f"{z_deposit_position:04}",
+      zg=f"{z_position_at_command_end:04}",
+    )
+
+  async def move_core_384_to_safe_positions(self):
+    """
+    Move CoRe 384 Head to Z save position
+    """
+
+    return await self.send_command(module="C0", command="JV")
+
   # -------------- 3.11.2 Tip handling using 384 Head --------------
+
+  async def pick_up_tips_core384(  # JB
+    self,
+    x_position: int = 0,
+    x_direction: int = 0,
+    y_position: int = 5640,
+    tip_type: int = 0,
+    tip_pickup_method: int = 0,
+    centering: int = 1,
+    z_pick_up_position: int = 3270,
+    minimal_traverse_height_at_beginning_of_command: int = 3270,
+    minimal_height_at_command_end: int = 3270,
+  ):
+    pass
+
+  async def discard_tips_core384(  # JC
+    self,
+    x_position: int = 0,
+    x_direction: int = 0,
+    y_position: int = 5640,
+    z_deposit_position: int = 3270,
+    minimal_traverse_height_at_beginning_of_command: int = 3270,
+    minimal_height_at_command_end: int = 3270,
+  ):
+    pass
 
   # -------------- 3.11.3 Liquid handling using 384 Head --------------
 
+  async def aspirate_core384(  # JA
+    self,
+    aspiration_type: int = 0,
+    x_position: int = 0,
+    x_direction: int = 0,
+    y_position: int = 5640,
+    minimal_traverse_height_at_beginning_of_command: int = 3270,
+    minimal_height_at_command_end: int = 3270,
+    lld_search_height: int = 3270,
+    liquid_surface_at_function_without_lld: int = 3270,
+    pull_out_distance_to_take_transport_air_in_function_without_lld: int = 50,
+    maximum_immersion_depth: int = 3270,
+    tube_2nd_section_height_measured_from_jm: int = 0,
+    tube_2nd_section_ratio: int = 0,
+    immersion_depth: int = 0,
+    immersion_depth_direction: int = 0,
+    liquid_surface_sink_distance_at_the_end_of_aspiration: int = 0,
+    aspiration_volume: int = 0,
+    aspiration_speed: int = 2000,
+    transport_air_volume: int = 0,
+    blow_out_air_volume: int = 100,
+    pre_wetting_volume: int = 0,
+    lld_mode: int = 1,
+    gamma_lld_sensitivity: int = 1,
+    swap_speed: int = 100,
+    settling_time: int = 0,
+    homogenization_volume: int = 0,  # mix_volume
+    homogenization_cycles: int = 0,  # mix_cycles
+    homogenization_position_from_liquid_surface: int = 0,  # mix_position_from_liquid_surface
+    homogenization_speed: int = 2000,  # speed_of_mix
+    homogenization_surface_following_distance: int = 0,  # surface_following_distance_during_mix
+    capacitive_lld_gain: int = 7,
+    capacitive_lld_offset: int = 7,
+  ):
+    pass
+
+  async def dispense_core384(  # JD
+    self,
+    dispensing_mode: int = 0,
+    x_position: int = 0,
+    x_direction: int = 0,
+    y_position: int = 5640,
+    maximum_immersion_depth: int = 3270,
+    tube_2nd_section_height_measured_from_jm: int = 0,
+    tube_2nd_section_ratio: int = 0,
+    lld_search_height: int = 3270,
+    liquid_surface_at_function_without_lld: int = 3270,
+    pull_out_distance_to_take_transport_air_in_function_without_lld: int = 50,
+    immersion_depth: int = 0,
+    immersion_depth_direction: int = 0,
+    liquid_surface_elevation_distance_at_the_end_of_dispense: int = 0,
+    minimal_traverse_height_at_beginning_of_command: int = 3270,
+    minimal_height_at_command_end: int = 3270,
+    dispense_volume: int = 0,
+    dispense_speed: int = 2000,
+    cut_off_speed: int = 1500,
+    stop_back_volume: int = 0,
+    transport_air_volume: int = 0,
+    blow_out_air_volume: int = 0,
+    lld_mode: int = 1,
+    gamma_lld_sensitivity: int = 1,
+    side_touch_off_distance: int = 0,
+    swap_speed: int = 100,
+    settling_time: int = 0,
+    homogenization_volume: int = 0,  # mix_volume
+    homogenization_cycles: int = 0,  # mix_cycles
+    homogenization_position_from_liquid_surface: int = 0,  # mix_position_from_liquid_surface
+    homogenization_speed: int = 2000,  # speed_of_mix
+    homogenization_surface_following_distance: int = 0,  # surface_following_distance_during_mix
+    capacitive_lld_gain: int = 7,
+    capacitive_lld_offset: int = 7,
+  ):
+    pass
+
   # -------------- 3.11.4 Adjustment & movement commands --------------
+
+  async def move_core_384_head_to_defined_position(  # EN
+    self,
+    x_position: int = 0,
+    x_direction: int = 0,
+    y_position: int = 5640,
+    z_position: int = 3270,
+    minimal_height_at_beginning_of_command: int = 3270,
+  ):
+    pass
+
+  async def move_core_384_head_to_safe_position(
+    self,
+    y_position: int = 5640,
+    minimal_height_at_beginning_of_command: int = 3270,
+  ):
+    pass
 
   # -------------- 3.11.5 Wash procedure commands using 384 Head --------------
 
   # -------------- 3.11.6 Query 384 Head --------------
+
+  async def request_tip_presence_in_core_384_head(self):
+    pass
+
+  async def request_position_of_core_384_head(self):
+    pass
+
+  async def request_type_of_core_384_head(self):
+    pass
 
   # -------------- 3.12 Nano pipettor commands --------------
 
