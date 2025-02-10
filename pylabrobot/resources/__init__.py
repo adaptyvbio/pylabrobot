@@ -13,6 +13,8 @@ from .carrier import (
   create_homogeneous_resources,
   create_resources,
 )
+from .celltreat import *
+from .cellvis import *
 from .container import Container
 from .coordinate import Coordinate
 from .corning_axygen import *
