@@ -620,6 +620,280 @@ class TestiSWAPYMaxBootstrap(unittest.IsolatedAsyncioTestCase):
     await b._iswap_rotation_drive_request_y_max()
 
 
+def _extended_conf_with_384_head(installed: bool = True):
+  """A copy of the default extended configuration with the 384-head flag set.
+
+  Args:
+    installed: Whether the 384 head is reported as installed on the left X drive.
+
+  Returns:
+    A copy of `_DEFAULT_EXTENDED_CONFIGURATION` with the flag applied.
+  """
+  conf = copy.deepcopy(_DEFAULT_EXTENDED_CONFIGURATION)
+  conf.left_x_drive = copy.deepcopy(conf.left_x_drive)
+  conf.left_x_drive.dispensing_head_384_installed = installed
+  return conf
+
+
+class TestSTAR384HeadFirmwareCommands(unittest.IsolatedAsyncioTestCase):
+  """Firmware string generation for the 384-head commands (spec E2891001a, section 3.11).
+
+  Firmware-primitives only: these exercise `STARBackend` directly, not the `LiquidHandler`-level
+  resource-aware wrapping the 96-head commands get tested through in
+  `TestSTARLiquidHandlerCommands` -- that layer doesn't exist yet for the 384 head.
+  """
+
+  async def asyncSetUp(self):
+    self.star = STARBackend(read_timeout=1)
+    self.star._write_and_read_command = unittest.mock.AsyncMock()
+    self.star.io = unittest.mock.AsyncMock()
+    self.star._extended_conf = _extended_conf_with_384_head()
+    self.star._iswap_parked = True
+
+  def _assert_sent(self, cmd: str):
+    self.star._write_and_read_command.assert_has_calls([_any_write_and_read_command_call(cmd)])
+
+  async def test_initialize_core_384_head_matches_capture(self):
+    """JI must reproduce a captured firmware command byte for byte."""
+    await self.star.initialize_core_384_head(
+      x_position=1613,
+      x_direction=1,
+      y_position=1169,
+      z_deposit_position=2420,
+      z_position_at_end=2450,
+    )
+    self._assert_sent("C0JIid0001xs01613xd1yk1169je2420zg2450")
+
+  async def test_y_position_below_range_is_rejected(self):
+    """The Y range is a firmware limit and must be enforced before sending."""
+    with self.assertRaises(AssertionError):
+      await self.star.initialize_core_384_head(
+        x_position=1613,
+        x_direction=1,
+        y_position=1000,
+        z_deposit_position=2420,
+        z_position_at_end=2450,
+      )
+
+  async def test_request_core_384_head_initialization_status_parses_response(self):
+    """QW, asked of module D0, must parse to a bool."""
+    self.star._write_and_read_command.return_value = "D0QWid0001qw1"
+    self.assertTrue(await self.star.request_core_384_head_initialization_status())
+    self._assert_sent("D0QWid0001")
+
+  async def test_head384_move_to_z_safety_matches_capture(self):
+    """JV must reproduce a captured firmware command."""
+    await self.star.head384_move_to_z_safety()
+    self._assert_sent("C0JVid0001")
+
+  async def test_define_tip_384_matches_capture(self):
+    """TT must reproduce a captured tip type registration for collar type 6."""
+    await self.star.define_tip_384(
+      tip_type_table_index=33,
+      filtered=False,
+      length_mm=31.9,
+      max_volume_ul=70.0,
+      collar_type=6,
+    )
+    self._assert_sent("C0TTid0001tt33tf0tl0319tv00700tg6tu0")
+
+  async def test_pick_up_tips_core384_matches_capture(self):
+    """JB must reproduce a captured firmware command byte for byte."""
+    await self.star.pick_up_tips_core384(
+      x_position=1157,
+      x_direction=0,
+      y_position=2442,
+      tip_type_table_index=33,
+      z_pick_up_position=2195,
+      minimum_traverse_height_at_beginning_of_a_command=2450,
+      minimum_height_at_command_end=2450,
+      centering=False,
+    )
+    self._assert_sent("C0JBid0001xs01157xd0yk2442tt33iu0je2195zf2450zg2450ii0")
+
+  async def test_discard_tips_core384_to_rack_matches_capture(self):
+    """JC must reproduce a captured return-to-rack command."""
+    await self.star.discard_tips_core384(
+      x_position=1157,
+      x_direction=0,
+      y_position=2442,
+      z_deposit_position=2195,
+      minimum_traverse_height_at_beginning_of_a_command=2450,
+      minimum_height_at_command_end=2450,
+    )
+    self._assert_sent("C0JCid0001xs01157xd0yk2442je2195zf2450zg2450jd0")
+
+  async def test_discard_tips_core384_to_waste_matches_capture(self):
+    """JC to the eject/waste position is a genuinely different capture from returning tips to
+    the rack -- same literal coordinates JI itself ejects to."""
+    await self.star.discard_tips_core384(
+      x_position=1613,
+      x_direction=1,
+      y_position=1169,
+      z_deposit_position=2420,
+      minimum_traverse_height_at_beginning_of_a_command=2450,
+      minimum_height_at_command_end=2450,
+    )
+    self._assert_sent("C0JCid0001xs01613xd1yk1169je2420zf2450zg2450jd0")
+
+  async def test_aspirate_core_384_matches_capture(self):
+    """JA must reproduce a captured command, which omits ig and ih (no capacitive LLD)."""
+    await self.star.aspirate_core_384(
+      x_position=2507,
+      x_direction=0,
+      y_position=3402,
+      minimum_traverse_height_at_beginning_of_a_command=2450,
+      minimum_height_at_command_end=2450,
+      lld_search_height=2231,
+      liquid_surface_no_lld=1901,
+      minimum_height=1861,
+      aspiration_volume=4800,
+      aspiration_speed=500,
+      transport_air_volume=300,
+      blow_out_air_volume=300,
+      lld_mode=0,
+      swap_speed=20,
+      settling_time=10,
+      homogenization_speed=500,
+      pull_out_distance_transport_air=100,
+    )
+    self._assert_sent(
+      "C0JAid0001ja0xs02507xd0yk3402zf2450zg2450jz2231jt1901jm1861jw000jx0jh000jf04800"
+      "jg0500ju0300jv00300jy00000jq0jp1js0020ji10jj00000jk00jl000jn0500zw0000zs00000"
+      "mk000pq0100"
+    )
+
+  async def test_dispense_core_384_matches_capture(self):
+    """JD must reproduce a captured command, which omits ig and ih (no capacitive LLD)."""
+    await self.star.dispense_core_384(
+      dispensing_mode=1,
+      x_position=2507,
+      x_direction=0,
+      y_position=1482,
+      minimum_traverse_height_at_beginning_of_a_command=2450,
+      minimum_height_at_command_end=2450,
+      lld_search_height=2001,
+      liquid_surface_no_lld=1876,
+      minimum_height=1871,
+      dispense_volume=4800,
+      dispense_speed=500,
+      cut_off_speed=200,
+      transport_air_volume=300,
+      blow_out_air_volume=300,
+      lld_mode=0,
+      swap_speed=20,
+      settling_time=5,
+      mix_speed=500,
+      pull_out_distance_transport_air=100,
+    )
+    self._assert_sent(
+      "C0JDid0001jo1xs02507xd0yk1482jm1871jz2001jt1876jw000jx0jh000zf2450zg2450jb04800"
+      "jc0500jr0200im0000ju0300jv00300jq0jp1js0020ji05jj00000jk00jl000jn0500zw0000ij00"
+      "zs00000mk000pq0100"
+    )
+
+  async def test_move_core_384_head_to_defined_position_field_widths(self):
+    """EN field widths follow the specification's fixed-width notation."""
+    await self.star.move_core_384_head_to_defined_position(
+      x_position=365,
+      x_direction=0,
+      y_position=1169,
+      z_position=3200,
+      minimum_height_at_beginning_of_a_command=3270,
+    )
+    self._assert_sent("C0ENid0001xs00365xd0yk1169je3200zf3270")
+
+  async def test_move_core_384_head_to_defined_position_matches_capture(self):
+    """EN must reproduce a captured all-axis move."""
+    await self.star.move_core_384_head_to_defined_position(
+      x_position=1157,
+      x_direction=0,
+      y_position=3402,
+      z_position=2450,
+      minimum_height_at_beginning_of_a_command=2450,
+    )
+    self._assert_sent("C0ENid0001xs01157xd0yk3402je2450zf2450")
+
+  async def test_safety_move_core_384_head_to_y_matches_capture(self):
+    """EY must reproduce a captured command: only yk and zf, no x/z."""
+    await self.star.safety_move_core_384_head_to_y(
+      y_position=2442,
+      minimum_height_at_beginning_of_a_command=3200,
+    )
+    self._assert_sent("C0EYid0001yk2442zf3200")
+
+  async def test_wash_tips_core384_field_widths(self):
+    """JG field widths follow the specification's fixed-width notation. No capture exists for
+    this command: this instrument has no wash station."""
+    await self.star.wash_tips_core384(
+      x_position=1157,
+      x_direction=0,
+      y_position=2442,
+      wash_z_position=1800,
+      minimum_height=1700,
+      minimum_traverse_height_at_beginning_of_a_command=2450,
+      wash_volume=5000,
+      wash_cycles=3,
+    )
+    self._assert_sent("C0JGid0001xs01157xd0yk2442jt1800jm1700jh000zf2450jj05000jk03jn2000")
+
+  async def test_empty_washed_tips_core384_field_widths(self):
+    """JU field widths follow the specification's fixed-width notation. No capture exists for
+    this command: this instrument has no wash station."""
+    await self.star.empty_washed_tips_core384(
+      z_position=2450,
+      minimum_height_at_command_end=2450,
+    )
+    self._assert_sent("C0JUid0001jt2450zg2450")
+
+  async def test_request_tip_presence_in_core_384_head_parses_response(self):
+    """QK's response must be parsed into a bool."""
+    self.star._write_and_read_command.return_value = "C0QKid0001er00/00qk1"
+    self.assertTrue(await self.star.request_tip_presence_in_core_384_head())
+    self._assert_sent("C0QKid0001")
+
+  async def test_request_position_of_core_384_head_parses_response(self):
+    """QJ's response fields must be parsed from a captured reply."""
+    self.star._write_and_read_command.return_value = "C0QJid0001er00/00xs01157xd0yk3402je2450"
+    position = await self.star.request_position_of_core_384_head()
+    self.assertEqual(position["xs"], 1157)
+    self.assertEqual(position["xd"], 0)
+    self.assertEqual(position["yk"], 3402)
+    self.assertEqual(position["je"], 2450)
+
+  async def test_head384_request_type_matches_capture(self):
+    """QY must reproduce a captured head type: shifted tip pickup."""
+    self.star._write_and_read_command.return_value = "C0QYid0001er00/00qy2"
+    self.assertEqual(await self.star.head384_request_type(), 2)
+    self._assert_sent("C0QYid0001")
+
+  async def test_head384_request_firmware_version_matches_capture(self):
+    """RF must reproduce a captured version and build date."""
+    self.star._write_and_read_command.return_value = "D0RFid0001rf1.4S b 2015-10-07"
+    version, build_date = await self.star.head384_request_firmware_version()
+    self.assertEqual(version, "1.4S b")
+    self.assertEqual(build_date, datetime.date(2015, 10, 7))
+    self._assert_sent("D0RFid0001")
+
+  async def test_command_rejected_without_installed_head(self):
+    """Commands must refuse to run on an instrument that reports no 384 head."""
+    self.star._extended_conf = _extended_conf_with_384_head(installed=False)
+    with self.assertRaises(RuntimeError) as ctx:
+      await self.star.head384_move_to_z_safety()
+    self.assertIn("requires a 384-head", str(ctx.exception))
+    self.star._write_and_read_command.assert_not_called()
+
+  async def test_head384_installed_true(self):
+    """The property must reflect an instrument that reports a 384 head."""
+    self.star._extended_conf = _extended_conf_with_384_head(installed=True)
+    self.assertTrue(self.star.head384_installed)
+
+  async def test_head384_installed_false(self):
+    """The property must reflect an instrument that reports no 384 head."""
+    self.star._extended_conf = _extended_conf_with_384_head(installed=False)
+    self.assertFalse(self.star.head384_installed)
+
+
 class TestSTARUSBComms(unittest.IsolatedAsyncioTestCase):
   """Test that USB data is parsed correctly."""
 
