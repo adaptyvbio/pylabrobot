@@ -49,6 +49,21 @@ class DefaultAxisConfigTests(unittest.TestCase):
     for axis in ALL_AXES:
       self.assertIn(axis, DEFAULT_SPEEDS)
 
+  def test_default_park_position_is_within_software_limits(self):
+    # HomeTask parks every axis at its configured homing_offset once homing
+    # completes (see Agile7612Controller.get_park_position), and every move
+    # is rejected outside the axis's own range -- so a default homing_offset
+    # outside that range would make a from-scratch home() fail on that axis
+    # every time.
+    for axis in ALL_AXES:
+      cfg = default_axis_config(axis)
+      self.assertGreaterEqual(
+        cfg.homing_offset, cfg.range.min_pos, f"{axis} park position below its own range"
+      )
+      self.assertLessEqual(
+        cfg.homing_offset, cfg.range.max_pos, f"{axis} park position above its own range"
+      )
+
 
 class AxisConfigConstructionTests(unittest.TestCase):
   def test_explicit_config_overrides_every_field(self):

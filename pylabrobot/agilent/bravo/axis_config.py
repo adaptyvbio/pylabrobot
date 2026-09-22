@@ -134,15 +134,25 @@ def default_axis_config(axis: Axis) -> AxisConfig:
   default every controller in this package seeds itself with -- rather than
   an arbitrary placeholder.
 
+  :attr:`AxisConfig.homing_offset` defaults to ``0.0`` engineering units --
+  most axes' travel range brackets 0.0, so this is also their default park
+  position. Y's range, ``[0.5, 231.0]``, does not: its home sensor sits
+  0.5mm inside the low end of travel, not at 0.0. Clamping the default here
+  to the axis's own range, rather than special-casing Y, keeps every axis's
+  default park position inside its own software limits by construction, for
+  Y today and for any axis whose range is later changed to exclude 0.0.
+
   Args:
     axis: The axis to build a default configuration for.
 
   Returns:
     A complete, typed configuration for ``axis``.
   """
+  axis_range = AXIS_RANGES[axis]
   return AxisConfig(
     axis=axis,
     ticks_per_eng_unit=_TICKS_PER_ENG_UNIT[axis],
-    range=AXIS_RANGES[axis],
+    range=axis_range,
+    homing_offset=min(max(0.0, axis_range.min_pos), axis_range.max_pos),
     speeds=DEFAULT_SPEEDS.get(axis, {}),
   )

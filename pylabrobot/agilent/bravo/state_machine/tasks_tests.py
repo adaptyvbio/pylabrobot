@@ -21,6 +21,7 @@ from ..head_mode import TipSelection, normalize_head_mode
 from ..protocol.v11_comm_tests import BufferedTransport
 from .tasks import (
   AspirateTask,
+  HomeTask,
   PickPlaceTask,
   TipsOffTask,
   TipsOnTask,
@@ -427,3 +428,44 @@ class StackHeightArithmeticTests(unittest.TestCase):
 
   def test_infer_count_floors_at_one_for_zero_thickness(self):
     self.assertEqual(_infer_stack_count_from_scan_height(50.0, 0.0), 1)
+
+
+class ParkHomedAxesRealControllerTests(unittest.IsolatedAsyncioTestCase):
+  """_park_homed_axes against a real Agile7612Controller, not SimulationController.
+
+  The golden-frame HomeTask tests all drive a RecordingSimulationController,
+  whose get_park_position() is its own separate implementation
+  (SimulationController.get_park_position) that never touches
+  Agile7612Controller.get_park_position(), default_axis_config(), or
+  _validate_target() -- the exact chain a real HomeTask run drives, and the
+  one that would reject a park target outside an axis's own software range
+  (e.g. Y's [0.5, 231.0]). A config-only test of default_axis_config() in
+  isolation could keep passing while this integration still failed, if
+  get_park_position or _validate_target ever diverged from
+  default_axis_config's own values.
+  """
+
+  async def test_park_targets_are_within_range_for_every_home_generation_axis(self):
+    controller = Agile7612Controller(BufferedTransport())
+    axes: list = ["z", "x", "y", "w"]
+    for axis in axes:
+      controller._homed[axis] = True
+
+    recorded_moves: list = []
+
+    def fake_move(moves, wait=True, timeout=30.0):
+      for m in moves:
+        # The same validation the real move() runs before ever touching
+        # the wire, so a park target outside an axis's software range is
+        # caught here too.
+        controller._validate_target(m)
+      recorded_moves.extend(moves)
+
+    controller.move = fake_move  # type: ignore[method-assign]
+
+    config = BravoMachineConfig()
+    task = HomeTask(controller, config, axes)
+
+    await task._park_homed_axes()
+
+    self.assertEqual({m.axis for m in recorded_moves}, set(axes))
