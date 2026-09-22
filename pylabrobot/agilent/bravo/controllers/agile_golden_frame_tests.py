@@ -21,6 +21,7 @@ tests on individual helper methods do not catch a wrong byte inside a
 
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 import time
@@ -28,11 +29,13 @@ import unittest
 from pathlib import Path
 
 from pylabrobot.agilent.bravo.axis_config import default_axis_config
+from pylabrobot.agilent.bravo.config import BravoMachineConfig
 from pylabrobot.agilent.bravo.controllers.agile_7612 import Agile7612Controller
 from pylabrobot.agilent.bravo.controllers.agile_srt import AgileSrtController
 from pylabrobot.agilent.bravo.controllers.base import AxisMoveInfo, JogParams
 from pylabrobot.agilent.bravo.errors import BravoError
 from pylabrobot.agilent.bravo.protocol.v11_comm_tests import BufferedTransport
+from pylabrobot.agilent.bravo.state_machine.tasks import DockGripperTask
 from pylabrobot.agilent.bravo.types import ALL_AXES
 
 _GOLDEN_PATH = Path(__file__).parent / "testdata" / "agile_golden_frames.json"
@@ -258,6 +261,27 @@ class MoveOriginOffsetTests(GoldenFrameTestCase):
     origin = controller._move_origin("zg")
     self.assertEqual(origin, 20.0)  # 0.0 homing_offset - (-20.0) firmware park
     expected_ticks = controller._to_ticks("zg", 10.0 - origin)
+    self.assertAlmostEqual(position_ticks, expected_ticks, places=3)
+
+  def test_dock_gripper_zg_move_targets_firmware_minus_20mm(self):
+    # Confirmed on hardware with the signed position readback: the real
+    # dock depth is exactly _FIRMWARE_PARK_MM["zg"] (-20mm), which
+    # DockGripperTask reaches by requesting get_park_position("zg") (0.0 by
+    # default) as its engineering-frame target -- _move_origin's own
+    # subtraction of the firmware park offset is what lands the move at
+    # -20mm in firmware terms.
+    controller, comm = _new_controller(Agile7612Controller)
+    controller._homed["zg"] = True
+    task = DockGripperTask(controller, BravoMachineConfig())
+
+    asyncio.run(task._move_zg_to_nesting())
+
+    prepare_move_calls = [hexdata for cid, hexdata in comm.calls if cid == 0xA2]
+    self.assertEqual(len(prepare_move_calls), 1)
+    payload = bytes.fromhex(prepare_move_calls[0])
+    position_ticks = struct.unpack_from("<f", payload, 1)[0]
+
+    expected_ticks = controller._to_ticks("zg", -20.0)  # firmware frame, not engineering
     self.assertAlmostEqual(position_ticks, expected_ticks, places=3)
 
 

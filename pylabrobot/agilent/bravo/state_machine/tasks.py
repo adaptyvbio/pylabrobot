@@ -1551,10 +1551,17 @@ class DockGripperTask(StateMachineTask):
     self._zg_target = self._resolve_zg_target()
 
   def _resolve_zg_target(self) -> float:
-    # Docking/nesting uses the absolute recessed Zg position even when the
-    # configured axis range does not include that negative value. Do not
-    # clamp to the configured min/max here.
-    return _GRIPPER_RECESS_DEPTH
+    # move()'s absolute-target math subtracts _move_origin(axis) -- for Zg,
+    # get_park_position(axis) minus its firmware park offset -- from
+    # whatever target this returns. Confirmed on hardware: the real dock
+    # depth is Zg's firmware park offset itself (get_park_position("zg")
+    # is what naturally lands there through that math).
+    #
+    # Do not clamp to the configured min/max here: on Agile 7612 hardware
+    # this depth sits outside Zg's configured software range, which
+    # describes reachable move targets during normal operation, not the
+    # raw homed/dock rest point.
+    return self._ctrl.get_park_position("zg")
 
   def get_steps(self) -> "list[tuple[str, Callable[[], Awaitable[None]]]]":
     """Return this task's steps, in execution order."""

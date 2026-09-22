@@ -2534,6 +2534,13 @@
   "dock_gripper_task.dock_gripper_no_plate": {
     "calls": [
       {
+        "args": {
+          "axis": "zg"
+        },
+        "method": "get_park_position",
+        "step": "<setup>"
+      },
+      {
         "args": {},
         "method": "is_plate_in_gripper",
         "step": "check_plate_sensor"
@@ -2552,7 +2559,7 @@
               "absolute": true,
               "acceleration": 500.0,
               "axis": "zg",
-              "position": -20.0,
+              "position": 0.0,
               "velocity": 50.0
             }
           ],
@@ -2582,6 +2589,13 @@
   "dock_gripper_task.dock_gripper_plate_detected_forced": {
     "calls": [
       {
+        "args": {
+          "axis": "zg"
+        },
+        "method": "get_park_position",
+        "step": "<setup>"
+      },
+      {
         "args": {},
         "method": "is_plate_in_gripper",
         "step": "check_plate_sensor"
@@ -2600,7 +2614,7 @@
               "absolute": true,
               "acceleration": 500.0,
               "axis": "zg",
-              "position": -20.0,
+              "position": 0.0,
               "velocity": 50.0
             }
           ],
@@ -3098,6 +3112,13 @@
         "step": "prepare_gripper_safe_state"
       },
       {
+        "args": {
+          "axis": "zg"
+        },
+        "method": "get_park_position",
+        "step": "prepare_gripper_safe_state"
+      },
+      {
         "args": {},
         "method": "is_plate_in_gripper",
         "step": "prepare_gripper_safe_state"
@@ -3116,7 +3137,7 @@
               "absolute": true,
               "acceleration": 500.0,
               "axis": "zg",
-              "position": -20.0,
+              "position": 0.0,
               "velocity": 50.0
             }
           ],
@@ -3250,6 +3271,13 @@
         "step": "finalize_gripper_safe_state"
       },
       {
+        "args": {
+          "axis": "zg"
+        },
+        "method": "get_park_position",
+        "step": "finalize_gripper_safe_state"
+      },
+      {
         "args": {},
         "method": "is_plate_in_gripper",
         "step": "finalize_gripper_safe_state"
@@ -3268,7 +3296,7 @@
               "absolute": true,
               "acceleration": 500.0,
               "axis": "zg",
-              "position": -20.0,
+              "position": 0.0,
               "velocity": 50.0
             }
           ],
