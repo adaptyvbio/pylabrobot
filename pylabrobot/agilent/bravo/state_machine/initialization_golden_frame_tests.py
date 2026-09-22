@@ -64,6 +64,18 @@ class HomeTaskGoldenTests(GoldenFrameTestCase):
     result = await run_task(task, ctrl)
     self.assert_matches_golden("home_task.home_all_forced_with_gripper_dock", result)
 
+  async def test_home_zg_only_leaves_g_unhomed_skips_dock(self):
+    # _finalize_gripper_safe_state must check whether "g" actually finished
+    # homed, not merely whether "zg" is among the *requested* axes --
+    # requesting only "zg" leaves G unhomed, and docking would command an
+    # unhomed G through DockGripperTask.
+    ctrl = new_controller(all_homed=False, gripper=True)
+    axes: list = ["z", "zg"]
+    task = HomeTask(ctrl, new_config(gripper=True), axes)
+    result = await run_task(task, ctrl)
+    self.assertNotIn("open_gripper", [c["method"] for c in result["calls"]])
+    self.assert_matches_golden("home_task.home_zg_only_leaves_g_unhomed_skips_dock", result)
+
 
 class DockGripperTaskGoldenTests(GoldenFrameTestCase):
   async def test_dock_gripper_no_plate(self):

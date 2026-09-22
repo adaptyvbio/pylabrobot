@@ -1501,6 +1501,13 @@ class HomeTask(StateMachineTask):
   async def _finalize_gripper_safe_state(self) -> None:
     if not self._use_gripper_safe_state:
       return
+    if not self._ctrl.is_axis_homed("g") or not self._ctrl.is_axis_homed("zg"):
+      # self._use_gripper_safe_state only reflects what this task was asked
+      # to home (e.g. "zg" in axes), not what actually finished homed -- a
+      # request for zg alone leaves g unhomed, and docking would command an
+      # unhomed g through a position it has no calibrated reading for yet.
+      logger.info("G/Zg not homed -- skipping post-home gripper safe state")
+      return
     task = DockGripperTask(
       self._ctrl, self._config, force_if_plate_detected=True, task_name="HomeDock"
     )

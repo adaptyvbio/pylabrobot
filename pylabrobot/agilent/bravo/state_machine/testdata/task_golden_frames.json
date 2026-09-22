@@ -3236,6 +3236,20 @@
         "step": "park_homed_axes"
       },
       {
+        "args": {
+          "axis": "g"
+        },
+        "method": "is_axis_homed",
+        "step": "finalize_gripper_safe_state"
+      },
+      {
+        "args": {
+          "axis": "zg"
+        },
+        "method": "is_axis_homed",
+        "step": "finalize_gripper_safe_state"
+      },
+      {
         "args": {},
         "method": "is_plate_in_gripper",
         "step": "finalize_gripper_safe_state"
@@ -3399,6 +3413,95 @@
       {
         "args": {
           "axis": "z"
+        },
+        "method": "is_axis_homed",
+        "step": "verify_homed"
+      }
+    ],
+    "status": "COMPLETED"
+  },
+  "home_task.home_zg_only_leaves_g_unhomed_skips_dock": {
+    "calls": [
+      {
+        "args": {
+          "axis": "z"
+        },
+        "method": "is_axis_homed",
+        "step": "safe_z_retract"
+      },
+      {
+        "args": {
+          "axis": "g"
+        },
+        "method": "is_axis_homed",
+        "step": "prepare_gripper_safe_state"
+      },
+      {
+        "args": {
+          "axes": [
+            "z",
+            "zg"
+          ],
+          "force": false
+        },
+        "method": "home_axes",
+        "step": "home_requested_axes"
+      },
+      {
+        "args": {
+          "axis": "z"
+        },
+        "method": "get_park_position",
+        "step": "park_homed_axes"
+      },
+      {
+        "args": {
+          "axis": "zg"
+        },
+        "method": "get_park_position",
+        "step": "park_homed_axes"
+      },
+      {
+        "args": {
+          "moves": [
+            {
+              "absolute": true,
+              "acceleration": 0.0,
+              "axis": "z",
+              "position": 0.0,
+              "velocity": 0.0
+            },
+            {
+              "absolute": true,
+              "acceleration": 0.0,
+              "axis": "zg",
+              "position": 0.0,
+              "velocity": 0.0
+            }
+          ],
+          "timeout": 30.0,
+          "wait": true
+        },
+        "method": "move",
+        "step": "park_homed_axes"
+      },
+      {
+        "args": {
+          "axis": "g"
+        },
+        "method": "is_axis_homed",
+        "step": "finalize_gripper_safe_state"
+      },
+      {
+        "args": {
+          "axis": "z"
+        },
+        "method": "is_axis_homed",
+        "step": "verify_homed"
+      },
+      {
+        "args": {
+          "axis": "zg"
         },
         "method": "is_axis_homed",
         "step": "verify_homed"
