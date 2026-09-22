@@ -1,16 +1,18 @@
 """Shared synchronous-to-asynchronous bridge for Bravo transports.
 
-Bravo controllers are synchronous and run inside ``asyncio.to_thread``, while
-PyLabRobot's I/O layer is asynchronous. Every concrete transport crosses that
-boundary the same way: it submits a coroutine to the event loop that owns its
-connection and blocks the calling worker thread until the coroutine completes.
-That crossing, its lifecycle, and the timeout accounting it needs live here, so
-a concrete transport supplies only its own I/O object and its read/write bodies.
+Bravo controllers are synchronous, while PyLabRobot's I/O layer is
+asynchronous. Every concrete transport crosses that boundary the same way: it
+submits a coroutine to a private event loop this bridge owns, running on its
+own background thread, and blocks the calling thread until the coroutine
+completes. That crossing, its lifecycle, and the timeout accounting it needs
+live here, so a concrete transport supplies only its own I/O object and its
+read/write bodies.
 """
 
 import asyncio
 import concurrent.futures
 import logging
+import threading
 from abc import abstractmethod
 from typing import Any, Coroutine, Optional, TypeVar
 
@@ -63,10 +65,13 @@ def _outer_bound(timeout: float) -> float:
 class AsyncTransportBase(Transport):
   """A synchronous byte channel backed by an asynchronous PyLabRobot I/O object.
 
-  Each call submits its coroutine to the event loop that owns the connection, via
-  ``asyncio.run_coroutine_threadsafe``, and blocks the calling worker thread until
-  the coroutine completes. This cannot deadlock: the caller is never the loop
-  thread, so the loop remains free to run the coroutine.
+  Each call submits its coroutine to a private event loop this bridge starts on
+  its own background thread (see :meth:`_ensure_loop`), via
+  ``asyncio.run_coroutine_threadsafe``, and blocks the calling thread until the
+  coroutine completes. This cannot deadlock regardless of which thread or event
+  loop calls in: the loop the coroutine runs on is never the calling thread,
+  because this bridge -- not whatever loop happens to be running the caller --
+  owns it.
 
   Subclasses own their I/O object, open and close it through :meth:`_open_io` and
   :meth:`_close_io`, and implement :meth:`Transport.send`, :meth:`Transport.receive`
@@ -84,6 +89,7 @@ class AsyncTransportBase(Transport):
     self._transport_name = transport_name
     self._endpoint = endpoint
     self._loop: Optional[asyncio.AbstractEventLoop] = None
+    self._loop_thread: Optional[threading.Thread] = None
     self._connected = False
 
   @abstractmethod
@@ -94,8 +100,36 @@ class AsyncTransportBase(Transport):
   async def _close_io(self) -> None:
     """Close the underlying I/O object."""
 
+  def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+    """Start this transport's private event loop thread, if not already running.
+
+    The thread runs nothing but this loop for the transport's lifetime, so I/O
+    submitted to it never shares a thread -- and so never shares a lock -- with
+    whatever thread or loop a caller is running on.
+    """
+    if self._loop is not None:
+      return self._loop
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def _run_loop() -> None:
+      asyncio.set_event_loop(loop)
+      ready.set()
+      loop.run_forever()
+
+    thread = threading.Thread(
+      target=_run_loop,
+      name=f"bravo-{self._transport_name}-io",
+      daemon=True,
+    )
+    thread.start()
+    ready.wait()
+    self._loop = loop
+    self._loop_thread = thread
+    return loop
+
   async def setup(self) -> None:
-    """Open the connection and capture the owning event loop.
+    """Start this transport's private loop thread and open the connection on it.
 
     Raises:
       RuntimeError: If the transport is already set up. Opening a second time
@@ -105,20 +139,45 @@ class AsyncTransportBase(Transport):
     """
     if self._connected:
       raise RuntimeError("Transport is already set up. Call stop() before setting up again.")
-    loop = asyncio.get_running_loop()
-    await self._open_io()
-    self._loop = loop
+    loop = self._ensure_loop()
+    try:
+      await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._open_io(), loop))
+    except BaseException:
+      self._shutdown_loop()
+      raise
     self._connected = True
     logger.debug("[%s] Bravo %s transport connected", self._endpoint, self._transport_name)
 
   async def stop(self) -> None:
-    """Close the connection and release the owning event loop."""
+    """Close the connection and stop this transport's private loop thread.
+
+    Calls :meth:`_close_io` even if :meth:`setup` was never called, matching
+    this bridge's prior behavior: on whatever loop is already running if one
+    is, or inline otherwise, since with no private loop started there is no
+    other thread for it to conflict with.
+    """
     try:
-      await self._close_io()
+      loop = self._loop
+      if loop is not None:
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self._close_io(), loop))
+      else:
+        await self._close_io()
       logger.debug("[%s] Bravo %s transport disconnected", self._endpoint, self._transport_name)
     finally:
       self._connected = False
-      self._loop = None
+      self._shutdown_loop()
+
+  def _shutdown_loop(self) -> None:
+    """Stop and join this transport's private loop thread, if one is running."""
+    loop, thread = self._loop, self._loop_thread
+    self._loop = None
+    self._loop_thread = None
+    if loop is not None:
+      loop.call_soon_threadsafe(loop.stop)
+    if thread is not None:
+      thread.join(timeout=5.0)
+    if loop is not None:
+      loop.close()
 
   def _run(self, coro: Coroutine[Any, Any, T], timeout: float) -> T:
     """Run a coroutine on the owning loop and block until it completes.

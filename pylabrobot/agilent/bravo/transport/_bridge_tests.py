@@ -189,6 +189,22 @@ class AsyncTransportBaseTests(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result, b"real result")
     self.assertEqual(fake_future.cancel_calls, 0)
 
+  async def test_run_does_not_deadlock_when_called_from_the_running_loops_own_thread(self):
+    # A sync controller method can be called directly from a coroutine
+    # running on the caller's own event loop, rather than through
+    # asyncio.to_thread, which reaches _run on that loop's own thread. If
+    # _run submitted its coroutine to that same loop, the blocking
+    # future.result() below would wait forever for a loop that can never
+    # run because its own thread is the one blocked waiting for it. _run
+    # stays safe here because its coroutine runs on this bridge's own
+    # private loop thread, never on the caller's.
+    async def quick() -> bytes:
+      return b"ok"
+
+    result = self.transport._run(quick(), 1.0)
+
+    self.assertEqual(result, b"ok")
+
   async def test_run_reraises_coroutines_own_exception_when_future_races_to_failure(self):
     # Same race, but the coroutine itself failed with a non-timeout error.
     # _run must surface that real exception, not the outer
