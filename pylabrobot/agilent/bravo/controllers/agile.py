@@ -962,7 +962,28 @@ class AgileController(BravoController):
     )
 
   def is_plate_in_gripper(self) -> bool:
-    """Return whether the gripper's jaw position indicates a plate is held."""
+    """Return whether the gripper's jaw position indicates a plate is held.
+
+    This is a position heuristic, not a dedicated sensor reading: it
+    compares G's current position against the configured "open" position.
+    Before G has been homed, its position has no calibrated reference
+    frame -- get_position() falls back to an unadjusted raw register
+    reading, which can be an arbitrary, physically-meaningless value -- so
+    this heuristic cannot tell whether a plate is present. Returns False
+    (and logs) in that case, rather than comparing that raw value against
+    the open position and forcing a false "plate detected".
+
+    Returns:
+      False if G is unhomed (unknown, not "no plate") or the check fails to
+      read a position; otherwise whether G's position differs from the
+      configured open position by more than the tolerance.
+    """
+    if not self.is_axis_homed("g"):
+      logger.warning(
+        "is_plate_in_gripper: G axis is not homed; its position is not yet "
+        "calibrated, so plate presence is unknown. Reporting no plate."
+      )
+      return False
     try:
       pos_ticks = self._to_ticks("g", self.get_position("g"))
       open_ticks = self._to_ticks("g", OPEN_GRIPPER_POSITION)

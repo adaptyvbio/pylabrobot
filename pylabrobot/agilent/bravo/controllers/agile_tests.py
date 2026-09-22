@@ -583,5 +583,26 @@ class TimeoutUnitsAreSecondsTests(unittest.TestCase):
     self.assertTrue(controller.ping())
 
 
+class IsPlateInGripperTests(unittest.TestCase):
+  def setUp(self):
+    self.controller = AgileController(BufferedTransport())
+
+  def test_returns_false_and_logs_when_g_is_unhomed(self):
+    # An unhomed G's position has no calibrated reference frame --
+    # get_position() can return an arbitrary raw register reading -- so it
+    # must not be compared against the open position, which would produce
+    # a false "plate detected".
+    self.assertFalse(self.controller.is_axis_homed("g"))
+    with self.assertLogs("pylabrobot.agilent.bravo.controllers.agile", "WARNING") as logs:
+      self.assertFalse(self.controller.is_plate_in_gripper())
+    self.assertIn("not homed", "\n".join(logs.output))
+
+  def test_evaluates_position_normally_once_g_is_homed(self):
+    # The unhomed guard must not block the ordinary, already-working path.
+    self.controller._homed["g"] = True
+    self.controller.get_position = lambda axis: 5.0  # type: ignore[method-assign]
+    self.assertTrue(self.controller.is_plate_in_gripper())
+
+
 if __name__ == "__main__":
   unittest.main()
