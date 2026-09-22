@@ -775,6 +775,143 @@ class Agile7612Controller(AgileController):
       custom_text=f"Timed out: {[axis_label(a) for a in axes]} ({timeout}s)",
     )
 
+  # G-only: its homing search phases end in a stall against a mechanical
+  # stop -- confirmed on hardware, the status goes 0x86 the instant motion
+  # stops and stays there, with the raw position frozen, for as long as
+  # the axis is left alone. This is not a sensor-triggered settle: G's
+  # sensor register (0x10) does not change at all during G homing on this
+  # hardware, unlike X/Y/Z/W/Zg, which do home against a real sensor and
+  # settle normally -- so this is deliberately not folded into
+  # _agile_7612_wait_for_settled itself.
+  # A stall is detected and returns early via the 0x86 + stable-position
+  # check well before this timeout fires, so the ceiling only matters for a
+  # phase that's genuinely still settling -- confirmed on hardware with a
+  # real profile's slow G homing speed (1.0 mm/s, 10x slower than this
+  # driver's own default): the negative/slow approach phase was still
+  # moving at 15s and needed most of 60s to finish.
+  _G_HOMING_SEARCH_TIMEOUT_S = 60.0
+  _G_HOMING_STALL_STABLE_DURATION_S = 0.3
+  _G_HOMING_STALL_POSITION_TOLERANCE_MM = 0.05
+  _G_HOMING_MIN_SETTLE_TIME_S = 0.3
+
+  def _wait_for_g_homing_search_phase(
+    self,
+    timeout: float = _G_HOMING_SEARCH_TIMEOUT_S,
+    stable_duration: float = _G_HOMING_STALL_STABLE_DURATION_S,
+    position_tolerance: float = _G_HOMING_STALL_POSITION_TOLERANCE_MM,
+    min_settle_time: float = _G_HOMING_MIN_SETTLE_TIME_S,
+  ) -> None:
+    """Wait for one of G's homing search moves to finish, stall included.
+
+    Accepts either a genuine settle (the same 0x00-or-0xB0-0xBF band
+    :meth:`_agile_7612_wait_for_settled` requires, in case some future
+    firmware or hardware state ever reports one for G) or a stall: G's
+    ctrl2 status reading 0x86 while its raw position has stayed within
+    ``position_tolerance`` for at least ``stable_duration``. Position is
+    read via :meth:`_read_raw_position`, not the optimistic tracked-position
+    cache :meth:`move` updates on its own.
+
+    A settled status is only trusted once real motion has been observed
+    (the raw position has moved by more than ``position_tolerance`` from
+    where it stood when this wait started) or ``min_settle_time`` has
+    elapsed since then, whichever comes first -- a status read taken right
+    after ``move_go`` can still reflect the axis's state from before the
+    move was triggered, and 0x00 in particular means both "idle, never
+    moved" and "idle, already done": without one of these two guards, that
+    stale reading would end the wait before the move has actually started.
+
+    Issues a controller-2 fault reset only on the stall path, right before
+    returning, so the next search phase starts from a clean fault state --
+    the same reset the diagnostic script that characterized this behavior
+    used between phases. A genuine settle does not reset: controller 2 is
+    not in a fault state there, and resetting it anyway would perturb
+    whatever servo state the settle left behind immediately before the
+    next phase's servo-register writes.
+
+    Args:
+      timeout: Maximum time to wait, in seconds.
+      stable_duration: How long the raw position must stay within
+        ``position_tolerance`` before a 0x86 status is trusted as "stalled
+        at the mechanical stop" rather than "about to move again."
+      position_tolerance: Maximum position change, in the raw position
+        reading's own units (mm), to still count as "stable."
+      min_settle_time: Minimum time since this wait started before a
+        settled status is trusted without having observed real motion.
+
+    Raises:
+      BravoError: If neither a settle nor a stable stall is seen within
+        ``timeout``.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    self._require_connected()
+    initial_position: Optional[float] = None
+    motion_observed = False
+    last_position: Optional[float] = None
+    stable_since: Optional[float] = None
+    last_status: Optional[int] = None
+    while time.monotonic() < deadline:
+      try:
+        resp = self._agile_7612_status_read(self._STATUS_REG_GENERAL, 4)
+        if len(resp) >= 6:
+          last_status = resp[2]  # G is local axis index 0 on ctrl2.
+      except (BravoError, TimeoutError, ConnectionError):
+        pass
+
+      try:
+        position = self._read_raw_position("g")
+      except BravoError:
+        position = None
+
+      now = time.monotonic()
+      if position is not None:
+        if initial_position is None:
+          initial_position = position
+        elif not motion_observed and abs(position - initial_position) > position_tolerance:
+          motion_observed = True
+
+      settled = last_status is not None and (
+        last_status == 0x00 or (last_status & 0xF0) == self._STATUS_SETTLED
+      )
+      if settled and (motion_observed or (now - start) >= min_settle_time):
+        logger.info(
+          "G homing search phase settled: status=0x%02X position=%s",
+          last_status,
+          f"{position:.3f}" if position is not None else "<unread>",
+        )
+        return
+
+      if position is not None:
+        if last_position is None or abs(position - last_position) > position_tolerance:
+          last_position = position
+          stable_since = now
+        elif (
+          stable_since is not None
+          and (now - stable_since) >= stable_duration
+          and last_status == 0x86
+        ):
+          logger.info(
+            "G homing search phase stalled at mechanical stop: "
+            "status=0x%02X position=%.3f (stable %.2fs)",
+            last_status,
+            position,
+            now - stable_since,
+          )
+          self._agile_7612_fault_reset_ctrl2()
+          return
+
+      time.sleep(self._MOVE_POLL_INTERVAL)
+
+    status_str = f"0x{last_status:02X}" if last_status is not None else "<unread>"
+    position_str = f"{last_position:.3f}" if last_position is not None else "<unread>"
+    raise BravoError(
+      ErrorType.MOVE_TIMEOUT,
+      custom_text=(
+        f"G homing search phase timed out after {timeout}s "
+        f"(last status={status_str}, last position={position_str})"
+      ),
+    )
+
   # =================================================================
   # Homing -- two-phase with between-phase servo swaps
   # =================================================================
@@ -1366,7 +1503,9 @@ class Agile7612Controller(AgileController):
   def _home_g(self) -> None:
     """Home the G axis (gripper jaws).
 
-    Controller 2, sensor at the negative end. Always uses the same
+    Controller 2, ends each search phase in a stall against a mechanical
+    stop rather than a sensor -- the sensor register (0x10) does not
+    change at all during G homing on this hardware. Always uses the same
     2-phase pattern (positive fast, negative slow) regardless of starting
     position. Moves G to 0 both before and after the homing sequence,
     with a controller-2 fault reset around each move.
@@ -1393,7 +1532,11 @@ class Agile7612Controller(AgileController):
       )
       comm.send_command(CommandID.PREPARE_MOVE, info.pack())
       self._agile_7612_move_go([axis])
-      self._agile_7612_wait_for_settled([axis], timeout=30.0)
+      # G is not yet homed here (this move only prepares it), so a stall
+      # against wherever it currently sits is a normal outcome, not a
+      # failure -- the same stall-vs-settled ambiguity _home_g's own
+      # search phases have, just on an even less calibrated axis.
+      self._wait_for_g_homing_search_phase(timeout=5.0)
     except BravoError as exc:
       logger.warning("G homing: pre-move to 0 failed: %s", exc)
     self._agile_7612_fault_reset_ctrl2()
@@ -1427,7 +1570,7 @@ class Agile7612Controller(AgileController):
     )
     comm.send_command(CommandID.PREPARE_MOVE, info.pack())
     self._agile_7612_move_go([axis])
-    self._agile_7612_wait_for_settled([axis], timeout=60.0)
+    self._wait_for_g_homing_search_phase()
 
     self._agile_7612_servo_write(0xA4, _SERVO_A4_SWAPPED, axis)
     self._agile_7612_servo_write(0xA3, _SERVO_A3_SWAPPED, axis)
@@ -1442,7 +1585,7 @@ class Agile7612Controller(AgileController):
     )
     comm.send_command(CommandID.PREPARE_MOVE, info.pack())
     self._agile_7612_move_go([axis])
-    self._agile_7612_wait_for_settled([axis], timeout=60.0)
+    self._wait_for_g_homing_search_phase()
 
     try:
       self._agile_7612_servo_write(0xA4, _SERVO_A4_RESET, axis)
@@ -1519,7 +1662,9 @@ class Agile7612Controller(AgileController):
       )
       comm.send_command(CommandID.PREPARE_MOVE, info.pack())
       self._agile_7612_move_go(["g"])
-      self._agile_7612_wait_for_settled(["g"], timeout=30.0)
+      # G is not yet homed here either -- same reasoning as _home_g's own
+      # pre-move to 0.
+      self._wait_for_g_homing_search_phase(timeout=5.0)
     except BravoError as exc:
       logger.warning("Zg homing: G pre-move failed: %s", exc)
     self._agile_7612_fault_reset_ctrl2()

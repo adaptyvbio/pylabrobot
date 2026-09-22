@@ -118,14 +118,33 @@ def _run(cls, sensor_byte: int, action) -> list[tuple[int, str]]:
 
 
 class GoldenFrameTestCase(unittest.TestCase):
-  """Base class: silences real sleeps so polling loops (jog, tip_force_jog) run fast."""
+  """Base class: silences real sleeps and time so polling loops run fast.
+
+  ``time.sleep`` is a no-op here, and ``time.monotonic`` returns a fake
+  clock that advances a fixed step on every call, so a wait that only
+  resolves after real elapsed time (e.g. G-homing's settle/stall wait,
+  which requires either observed motion or a minimum elapsed time before
+  trusting a settled status) reaches that deadline in a small, bounded
+  number of iterations instead of spinning for real wall-clock seconds
+  with sleep silenced.
+  """
+
+  _FAKE_TIME_STEP_S = 0.01
 
   def setUp(self) -> None:
     self._real_sleep = time.sleep
+    self._real_monotonic = time.monotonic
+    self._fake_time = 0.0
     time.sleep = lambda *_a, **_k: None
+    time.monotonic = self._advance_fake_time
 
   def tearDown(self) -> None:
     time.sleep = self._real_sleep
+    time.monotonic = self._real_monotonic
+
+  def _advance_fake_time(self) -> float:
+    self._fake_time += self._FAKE_TIME_STEP_S
+    return self._fake_time
 
   def assert_matches_golden(self, scenario: str, calls: list) -> None:
     expected = [tuple(pair) for pair in GOLDEN[scenario]]

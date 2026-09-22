@@ -1,5 +1,6 @@
 import inspect
 import struct
+import time
 import unittest
 
 from pylabrobot.agilent.bravo.axis_config import AxisConfig, default_axis_config
@@ -253,14 +254,132 @@ class AxisConfigDefaultsTests(unittest.TestCase):
     self.assertEqual(controller._ticks_per_unit["w"], DEFAULT_W_TICKS_PER_UL)
 
   def test_w_ticks_per_unit_is_48_when_every_axis_is_given_its_own_default(self):
-    # Regression: building the axis_config mapping explicitly (rather than
-    # omitting it) must not silently change the W scale. Both paths through
-    # AxisConfig now resolve to the same DEFAULT_W_TICKS_PER_UL constant, so
-    # there is no longer a distinction between "axis missing from the
-    # mapping" and "axis present with its own default".
+    # Building the axis_config mapping explicitly (rather than omitting it)
+    # must not silently change the W scale: both paths through AxisConfig
+    # resolve to the same DEFAULT_W_TICKS_PER_UL constant, so there is no
+    # distinction between "axis missing from the mapping" and "axis present
+    # with its own default".
     explicit = {axis: default_axis_config(axis) for axis in ALL_AXES}
     controller = Agile7612Controller(BufferedTransport(), axis_config=explicit)
     self.assertEqual(controller._ticks_per_unit["w"], 48.0)
+
+
+class GHomingSearchPhaseWaitTests(unittest.TestCase):
+  """_wait_for_g_homing_search_phase: G homes against a mechanical stop, not
+  a sensor (confirmed on hardware), so its status never reaches the generic
+  0xB0-0xBF settled band _agile_7612_wait_for_settled requires -- it goes
+  0x86 and stays there, with position frozen, once the stall happens. This
+  method is the G-only replacement for the two homing search-phase waits in
+  _home_g; every other axis (and _home_g's own pre/post move-to-0 steps)
+  still use the unmodified _agile_7612_wait_for_settled.
+  """
+
+  def setUp(self):
+    self.controller = Agile7612Controller(BufferedTransport())
+    self.fault_reset_calls = 0
+    self.controller._agile_7612_fault_reset_ctrl2 = self._record_fault_reset  # type: ignore[method-assign]
+
+  def _record_fault_reset(self) -> None:
+    self.fault_reset_calls += 1
+
+  def _script_status(self, byte: int):
+    self.controller._agile_7612_status_read = (  # type: ignore[method-assign]
+      lambda *args, **kwargs: bytes([0, 0, byte, 0, 0, 0])
+    )
+
+  def test_default_timeout_covers_a_real_profiles_slower_g_homing_speed(self):
+    # Confirmed on hardware: with a real profile's slower G homing speed,
+    # the negative/slow approach phase is still moving, not stalled, at 15s
+    # and needs most of 60s to finish. A stall still returns early via the
+    # 0x86 + stable-position check well before any timeout fires, so a 60s
+    # ceiling only affects genuinely slow phases, not stall detection
+    # latency.
+    self.assertEqual(Agile7612Controller._G_HOMING_SEARCH_TIMEOUT_S, 60.0)
+
+  def test_completes_on_stall_when_status_is_0x86_and_position_is_stable(self):
+    self._script_status(0x86)
+    self.controller._read_raw_position = lambda axis: 42.0  # type: ignore[method-assign]
+
+    self.controller._wait_for_g_homing_search_phase(
+      timeout=1.0, stable_duration=0.05, position_tolerance=0.01
+    )
+
+    self.assertEqual(self.fault_reset_calls, 1)
+
+  def test_keeps_waiting_while_position_is_still_changing(self):
+    # A 0x86 status alone is not enough to call a phase complete -- G could
+    # read 0x86 for an instant while genuinely still moving. Only a
+    # position that has stopped changing for stable_duration is a real
+    # stall, not just a momentary status reading.
+    positions = [0.0, 5.0, 10.0, 15.0] + [15.0] * 200  # pads well past any poll count
+    self._script_status(0x86)
+    calls_made: list = []
+
+    def fake_read_position(axis: str) -> float:
+      calls_made.append(None)
+      return positions[len(calls_made) - 1]
+
+    self.controller._read_raw_position = fake_read_position  # type: ignore[method-assign]
+
+    self.controller._wait_for_g_homing_search_phase(
+      timeout=2.0, stable_duration=0.05, position_tolerance=0.01
+    )
+
+    # It must have actually observed the changing readings (0.0/5.0/10.0)
+    # before settling on the stable 15.0 -- completing on the very first
+    # poll (still reading 0.0) would mean it never checked for motion at all.
+    self.assertGreater(len(calls_made), 4)
+    self.assertEqual(self.fault_reset_calls, 1)
+
+  def test_times_out_when_neither_settle_nor_stall_is_ever_seen(self):
+    # Status never reaches 0x86 or a settled 0xB_ band, and position never
+    # stops changing -- this phase genuinely never finishes.
+    self._script_status(0x80)
+    counter = {"n": 0}
+
+    def ever_changing_position(axis: str) -> float:
+      counter["n"] += 1
+      return float(counter["n"])
+
+    self.controller._read_raw_position = ever_changing_position  # type: ignore[method-assign]
+
+    with self.assertRaises(BravoError) as ctx:
+      self.controller._wait_for_g_homing_search_phase(
+        timeout=0.2, stable_duration=0.05, position_tolerance=0.01
+      )
+
+    self.assertEqual(ctx.exception.error_type, ErrorType.MOVE_TIMEOUT)
+    self.assertEqual(self.fault_reset_calls, 0)
+
+  def test_still_accepts_a_genuine_settle_without_requiring_a_stall(self):
+    # Some future firmware/hardware state might report a real 0xB_ settle
+    # for G -- this must not require a stall to complete.
+    self._script_status(0xB4)
+    self.controller._read_raw_position = lambda axis: 7.0  # type: ignore[method-assign]
+
+    self.controller._wait_for_g_homing_search_phase(
+      timeout=1.0, stable_duration=0.05, position_tolerance=0.01, min_settle_time=0.05
+    )
+
+    # A genuine settle is not a fault: it must not reset controller 2.
+    self.assertEqual(self.fault_reset_calls, 0)
+
+  def test_does_not_accept_a_stale_0x00_before_motion_starts(self):
+    # A status read of 0x00 right after move_go can still reflect the
+    # axis's state from before the move was triggered -- 0x00 means both
+    # "idle, never moved" and "idle, already done". Without either
+    # observed motion or a minimum elapsed time, this must not be trusted.
+    self._script_status(0x00)
+    self.controller._read_raw_position = lambda axis: 3.0  # type: ignore[method-assign]  # never moves
+
+    start = time.monotonic()
+    self.controller._wait_for_g_homing_search_phase(
+      timeout=1.0, stable_duration=0.05, position_tolerance=0.01, min_settle_time=0.15
+    )
+    elapsed = time.monotonic() - start
+
+    self.assertGreaterEqual(elapsed, 0.15)
+    self.assertEqual(self.fault_reset_calls, 0)
 
 
 class SrtGripperlessTests(unittest.TestCase):
