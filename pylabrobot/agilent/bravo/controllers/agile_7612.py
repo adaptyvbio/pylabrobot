@@ -416,20 +416,29 @@ class Agile7612Controller(AgileController):
   # Position reading
   # =================================================================
 
-  _CTRL2_EFFECTIVE_TPU: dict[Axis, float] = {
-    "g": 126.8 * (944.882 / 787.402),
-    "zg": 126.8,
-  }
+  _POSITION_EXPONENT_BIAS = 15
 
-  # Position register resolution multiplier per axis: the register changes
-  # by (ticks_sent x multiplier) for each move. X/Y are 16x, Z is 8x; W is
-  # not yet independently measured and uses the same 8x as Z until it is.
-  _CTRL1_POSITION_SCALE: dict[Axis, float] = {
-    "x": 16.0,
-    "y": 16.0,
-    "z": 8.0,
-    "w": 8.0,
-  }
+  @classmethod
+  def _decode_position_ticks(cls, response: bytes) -> float:
+    """Decode a position-register response into signed encoder ticks.
+
+    The register is a mantissa/exponent pair, not a plain integer: bytes
+    [2:4] (big-endian) are a two's-complement 16-bit mantissa and byte 6
+    is an exponent, encoding ``ticks = mantissa * 2**(exponent - 15)``.
+    Confirmed exact (to the nearest tick) against five independent X/Y
+    hardware samples spanning 25-100mm and one negative Zg sample (-20mm,
+    right after homing).
+
+    Args:
+      response: The raw position-register response (at least 7 bytes).
+
+    Returns:
+      The decoded value, in encoder ticks. Divide by the axis's
+      ticks-per-unit to reach engineering units.
+    """
+    mantissa = struct.unpack_from(">h", response, 2)[0]
+    exponent = response[6]
+    return float(mantissa) * (2.0 ** (exponent - cls._POSITION_EXPONENT_BIAS))
 
   def _read_raw_position(self, axis: Axis) -> float:
     """Read the raw position register and convert it to engineering units.
@@ -447,15 +456,8 @@ class Agile7612Controller(AgileController):
     response = self._agile_7612_agile_read(0x07, axis)
     if len(response) < 10:
       raise BravoError(ErrorType.COULD_NOT_READ_POSITION, axis=axis)
-    raw_be_u16 = struct.unpack_from(">H", response, 2)[0]
-    if axis in _CONTROLLER_1_AXES:
-      scale = self._CTRL1_POSITION_SCALE.get(axis, 8.0)
-      tpu = self._ticks_per_unit.get(axis, 314.96)
-      return float(raw_be_u16) / (tpu * scale / 2.0)
-    sign = -1.0 if (raw_be_u16 & 0x8000) else 1.0
-    magnitude = raw_be_u16 & 0x7FFF
-    eff_tpu = self._CTRL2_EFFECTIVE_TPU.get(axis, 126.8)
-    return sign * float(magnitude) * 2.0 / eff_tpu
+    ticks = self._decode_position_ticks(response)
+    return ticks / self._ticks_per_unit[axis]
 
   def get_position(self, axis: Axis) -> float:
     """Return the current position of an axis, in engineering units (mm or uL).

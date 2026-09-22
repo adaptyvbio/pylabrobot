@@ -284,55 +284,76 @@ class PositionDecodeTests(unittest.TestCase):
   """Directly exercises _read_raw_position's byte decode, which the golden-frame
   scenarios cannot: RecordingComm's generic response is an all-zero, symmetric
   10 bytes, so a big-endian-vs-little-endian decode bug is invisible there.
+
+  The register is a mantissa/exponent pair, not a plain integer: bytes [2:4]
+  (big-endian) are a 16-bit mantissa and byte 6 is an exponent, encoding
+  ``ticks = mantissa * 2**(exponent - 15)``. The X fixtures below are the
+  exact response bytes captured on real hardware (Agile 7612, firmware
+  5.4.7) at four independently-verified X positions -- not synthesized --
+  so this pins the real wire format, not just an internally-consistent
+  formula.
   """
 
-  def test_controller_1_axis_decodes_the_position_register_big_endian(self):
-    controller, comm = _new_controller(Agile7612Controller)
+  def _response_for(self, mantissa: int, exponent: int) -> bytes:
+    return bytes(
+      [0x00, 0x00, (mantissa >> 8) & 0xFF, mantissa & 0xFF, 0x00, 0x00, exponent, 0x00, 0x00, 0x00]
+    )
+
+  def _patch_position_register(self, comm: RecordingComm, response: bytes) -> None:
     real_send_command = comm.send_command
 
     def send_command(command_id, data: bytes = b"", timeout: float = 2.0) -> bytes:
-      # Register 0x07 reads (raw position) get a deliberately asymmetric
-      # big-endian value; everything else keeps RecordingComm's normal
-      # canned responses.
       if len(data) > 1 and data[1] == 0x07:
         comm.calls.append((int(command_id), data.hex()))
-        return bytes([0x00, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        return response
       return real_send_command(command_id, data, timeout)
 
     comm.send_command = send_command  # type: ignore[method-assign]
+
+  def test_controller_1_axis_decodes_hardware_captured_x_positions(self):
+    # (mantissa, exponent, expected mm), all captured on real hardware.
+    hardware_samples = [
+      (0x7B08, 0x0D, 25.0),
+      (0x7B08, 0x0E, 50.0),
+      (0x5C46, 0x0F, 75.0),
+      (0x7B08, 0x0F, 100.0),
+    ]
+    for mantissa, exponent, expected_mm in hardware_samples:
+      with self.subTest(mantissa=hex(mantissa), exponent=hex(exponent)):
+        controller, comm = _new_controller(Agile7612Controller)
+        self._patch_position_register(comm, self._response_for(mantissa, exponent))
+        position = controller.get_position("x")
+        self.assertAlmostEqual(position, expected_mm, places=2)
+
+  def test_controller_1_axis_decodes_the_mantissa_big_endian(self):
+    controller, comm = _new_controller(Agile7612Controller)
+    # A deliberately asymmetric mantissa; exponent 15 (bias) keeps the
+    # scale factor at 1 so the mantissa alone determines the tick count.
+    self._patch_position_register(comm, self._response_for(0x1234, 0x0F))
 
     position = controller.get_position("x")
 
-    # _read_raw_position's own documented formula for a controller-1 axis:
-    # float(raw_be_u16) / (ticks_per_eng_unit * scale / 2.0), scale=16.0 for X.
-    raw_be_u16 = 0x1234
     ticks_per_eng_unit = controller._ticks_per_unit["x"]
-    expected = float(raw_be_u16) / (ticks_per_eng_unit * 16.0 / 2.0)
+    expected = float(0x1234) / ticks_per_eng_unit
     self.assertAlmostEqual(position, expected)
     # A little-endian misreading of the same two bytes (0x3412) would give a
     # visibly different result, so this also fails if the byte order flips.
-    wrong_le = float(0x3412) / (ticks_per_eng_unit * 16.0 / 2.0)
+    wrong_le = float(0x3412) / ticks_per_eng_unit
     self.assertNotAlmostEqual(position, wrong_le)
 
-  def test_controller_2_axis_decodes_sign_and_magnitude(self):
+  def test_controller_2_axis_decodes_a_hardware_captured_negative_zg_position(self):
+    # Captured on real hardware right after homing: response
+    # 910784f800000e020589 -> mantissa 0x84F8 as signed int16 = -31496,
+    # exponent 0x0E -> -15748 ticks -> -20.000mm at 787.4 ticks/mm, exactly
+    # _FIRMWARE_PARK_MM["zg"]. Decoding the mantissa as a full
+    # two's-complement int16 is required for this: sign-plus-15-bit-
+    # magnitude gives a meaningless -0.808 for the same bytes.
     controller, comm = _new_controller(Agile7612Controller)
-    real_send_command = comm.send_command
+    self._patch_position_register(comm, bytes.fromhex("910784f800000e020589"))
 
-    def send_command(command_id, data: bytes = b"", timeout: float = 2.0) -> bytes:
-      if len(data) > 1 and data[1] == 0x07:
-        comm.calls.append((int(command_id), data.hex()))
-        # High bit set (sign) + magnitude 0x0100 in the low 15 bits.
-        return bytes([0x00, 0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-      return real_send_command(command_id, data, timeout)
+    position = controller.get_position("zg")
 
-    comm.send_command = send_command  # type: ignore[method-assign]
-
-    position = controller.get_position("g")
-
-    eff_tpu = controller._CTRL2_EFFECTIVE_TPU.get("g", 126.8)
-    expected = -1.0 * float(0x0100) * 2.0 / eff_tpu
-    self.assertAlmostEqual(position, expected)
-    self.assertLess(position, 0.0)
+    self.assertAlmostEqual(position, -20.0, places=2)
 
 
 if __name__ == "__main__":
