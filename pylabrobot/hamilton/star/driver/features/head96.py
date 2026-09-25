@@ -35,8 +35,10 @@ class Head96Configuration(HeadConfiguration):
   initialize_command: str = "EI"
   tip_presence_command: str = "QH"
   position_command: str = "QI"
+  defined_position_command: str = "EM"
   y_parameter: str = "yh"
   z_parameter: str = "za"
+  traverse_z_parameter: str = "zh"
   z_end_parameter: str = "ze"
   x_offset_parameter: str = "kf"
   head_types: Dict[int, str] = field(
@@ -70,10 +72,7 @@ class Head96Configuration(HeadConfiguration):
   dispensing_drive_uL_per_increment: float = 0.019340933  # type: ignore[assignment]
   squeezer_drive_mm_per_increment: float = 0.0002086672009  # type: ignore[assignment]
 
-  # The Y window the master's tip commands accept, in deck mm at head channel A1. Narrower than
-  # what the Y drive itself reaches, and narrower than the initialization command's own window, so
-  # it is stated here rather than taken from `y_range`.
-  tip_command_y_range: Tuple[float, float] = (108.0, 560.0)
+  tip_command_y_range: Tuple[float, float] = (108.0, 560.0)  # type: ignore[assignment]
 
   # Where the dispensing drive is sent before tips are collected off a rack, as a piston volume in
   # uL. The device does not lower the drive itself, so a head left with its piston up would
@@ -339,94 +338,6 @@ class Head96(Head):
   # ----------------------------------------
   # Tip pickup and drop
   # ----------------------------------------
-
-  # -- where the head goes -----------------------------------------------------------------------
-
-  def _position_centred_in(self, resource: Resource) -> Coordinate:
-    """Where head channel A1 lands with the head centred over a resource, in deck mm.
-
-    The head is rigid and the resource is whatever it is being pointed at, so the array is put in
-    the middle of it and A1 falls half a channel pitch in from the array's own corner.
-
-    Args:
-      resource: what to centre over.
-
-    Returns:
-      The A1 position, in deck mm, at the resource's own Z.
-
-    Raises:
-      RuntimeError: If the driver was given no deck, so the resource has no deck position.
-    """
-    deck = self._driver.deck
-    if deck is None:
-      raise RuntimeError("this driver has no deck, so a resource has no position to centre in")
-    c = self.configuration
-    location = resource.get_location_wrt(deck)
-    return Coordinate(
-      location.x + (resource.get_size_x() - c.channel_array_size_x) / 2 + c.channel_pitch / 2,
-      location.y + (resource.get_size_y() - c.channel_array_size_y) / 2 + c.channel_pitch / 2,
-      location.z,
-    )
-
-  def _resolve_tip_command_heights(
-    self,
-    minimum_traverse_z_position_at_the_command_start: Optional[float],
-    minimum_z_position_at_the_command_end: Optional[float],
-  ) -> Tuple[float, float]:
-    """The two heights a tip command travels at, defaulted where the caller named neither.
-
-    Args:
-      minimum_traverse_z_position_at_the_command_start: how high the head travels to get there.
-      minimum_z_position_at_the_command_end: the height to leave the head at.
-
-    Returns:
-      The two, in mm, with `configuration.traversal_z_position` where None was given.
-    """
-    traversal = self.configuration.traversal_z_position
-    if minimum_traverse_z_position_at_the_command_start is None:
-      minimum_traverse_z_position_at_the_command_start = traversal
-    if minimum_z_position_at_the_command_end is None:
-      minimum_z_position_at_the_command_end = traversal
-    return (
-      minimum_traverse_z_position_at_the_command_start,
-      minimum_z_position_at_the_command_end,
-    )
-
-  def _check_tip_command(
-    self, location: Coordinate, traverse_z: float, end_z: float, skip_z: bool = False
-  ) -> None:
-    """Raise unless a tip command may run where it is being pointed.
-
-    Reachability is `_check_reachable`'s to answer, so X, Z and the two heights go through it. What
-    is left here is the one thing it does not cover: the Y window these commands accept is narrower
-    than what the Y drive reaches, so a position the head could physically get to may still be
-    refused by the command.
-
-    Args:
-      location: where the command would send head channel A1, in deck mm.
-      traverse_z: the traverse height it would use, in mm.
-      end_z: the height it would leave the head at, in mm.
-      skip_z: leave the position's Z unchecked, for a command that resolves it separately.
-
-    Raises:
-      ValueError: If a position is out of reach or outside the command's Y window.
-      RuntimeError: If the windows were not resolved.
-    """
-    self._check_reachable("x", location.x)
-    if not skip_z:
-      self._check_reachable("z", location.z)
-    self._check_reachable("z", traverse_z)
-    self._check_reachable("z", end_z)
-    low, high = self.configuration.tip_command_y_range
-    if not low <= location.y <= high:
-      raise ValueError(f"y must be between {low} and {high}, is {location.y}")
-
-  async def _record_after_tip_command(self) -> None:
-    """Read back where a tip command left the arm and the head, and record it."""
-    if self.arm is not None:
-      await self.arm.request_position()
-    await self.request_y_position()
-    await self.request_z_position()
 
   # -- pickup ------------------------------------------------------------------------------------
 
