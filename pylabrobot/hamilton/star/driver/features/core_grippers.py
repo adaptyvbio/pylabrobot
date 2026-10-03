@@ -85,6 +85,10 @@ class CoreGrippers:
     self._holding_resource_width: Optional[float] = None
     self._held_resource: Optional[Resource] = None
     self._taken_from: Optional[Tuple[Resource, Optional[Coordinate]]] = None
+    # For whoever acts a command out (the viewer), set before it is sent: what a grip takes and
+    # where it will hang from the front tool, or what a release puts down and where. Cleared by
+    # nothing in particular: each grip or release overwrites it.
+    self._handover: Optional[Tuple[Resource, Optional[Resource], Optional[Coordinate]]] = None
 
   # -- what carries them ---------------------------------------------------------------------------
 
@@ -176,19 +180,19 @@ class CoreGrippers:
     shaft = self._pipettes.shaft(self._front_channel)
     return shaft.tip if shaft is not None and shaft.has_tip() else None
 
-  def _hang_held_resource_on_the_front_tool(self) -> None:
-    """Hang the held resource from the front tool where the fingers hold it, so it rides with them.
+  def _hang_location(self, held: Resource, grip_height: float) -> Optional[Coordinate]:
+    """Where `held` hangs from the front tool, as its child location, or None without the model.
 
-    Its centre at the fingers' centre, its bottom `_grip_height` below the grip line - the front
-    channel's stop disc less the tool's overhang. Nothing happens while nothing models them.
+    Its centre at the fingers' centre, its bottom `grip_height` below the grip line - the front
+    channel's stop disc less the tool's overhang.
     """
-    held, grip_height, tool = self._held_resource, self._grip_height, self._front_tool()
-    if held is None or grip_height is None or not isinstance(tool, HamiltonCoreGripperTool):
-      return
+    tool = self._front_tool()
+    if not isinstance(tool, HamiltonCoreGripperTool):
+      return None
     back = self._pipettes.get_reference_point_location(cast(int, self._back_channel))
     front = self._pipettes.get_reference_point_location(cast(int, self._front_channel))
     if back is None or front is None:
-      return
+      return None
     grip_line = front.z - (tool.get_size_z() - tool.fitting_depth - tool.grip_line_height)
     center = held.center().rotated(get_rotation_wrt(held, self._deck))
     lfb = Coordinate(
@@ -196,8 +200,21 @@ class CoreGrippers:
       (back.y + front.y) / 2 - center.y,
       grip_line - grip_height,
     )
+    return lfb - tool.get_location_wrt(self._deck)
+
+  def _hang_held_resource_on_the_front_tool(self) -> None:
+    """Hang the held resource from the front tool where the fingers hold it, so it rides with them.
+
+    Nothing happens while nothing models them.
+    """
+    held, grip_height, tool = self._held_resource, self._grip_height, self._front_tool()
+    if held is None or grip_height is None or not isinstance(tool, HamiltonCoreGripperTool):
+      return
+    location = self._hang_location(held, grip_height)
+    if location is None:
+      return
     held.unassign()
-    tool.assign_child_resource(held, location=lfb - tool.get_location_wrt(self._deck))
+    tool.assign_child_resource(held, location=location)
 
   def _put_held_resource_on_the_deck(self) -> None:
     """Put a resource hanging from the front tool on the deck, where it is now."""
@@ -818,6 +835,9 @@ class CoreGrippers:
       raise ValueError(f"the fingers would close to {closed} mm; squeeze_mm is too large")
     await pipettes._require_iswap_parked()
 
+    # For whoever acts the command out: what is taken, and where it will hang.
+    self._handover = (resource, self._front_tool(), self._hang_location(resource, grip_height))
+
     source = (resource.parent, resource.location)
     try:
       async with pipettes._temporary_z_drive_profile(
@@ -928,6 +948,13 @@ class CoreGrippers:
     if y_clearance < 0:
       raise ValueError(f"y_clearance must be 0 or more, is {y_clearance}")
     await pipettes._require_iswap_parked()
+
+    # For whoever acts the command out: what is put down, and where it lands. A coordinate puts it
+    # on the deck at `location`; a resource takes it where it stands.
+    if isinstance(destination, Coordinate):
+      self._handover = (held, self._deck, location)
+    else:
+      self._handover = (held, destination, None)
 
     try:
       async with pipettes._temporary_z_drive_profile(
