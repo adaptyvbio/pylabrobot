@@ -208,6 +208,23 @@ def _requires_head96(
   return wrapper
 
 
+def _requires_head384(
+  method: Callable[Concatenate["STARBackend", _P], Coroutine[Any, Any, _R]],
+) -> Callable[Concatenate["STARBackend", _P], Coroutine[Any, Any, _R]]:
+  """Ensure that a 384-head is installed before running the command."""
+
+  @functools.wraps(method)
+  async def wrapper(self: "STARBackend", *args, **kwargs):
+    if not self.extended_conf.left_x_drive.dispensing_head_384_installed:
+      raise RuntimeError(
+        "This command requires a 384-head, but none is installed. "
+        "Check your instrument configuration."
+      )
+    return await method(self, *args, **kwargs)
+
+  return wrapper
+
+
 def convert_star_firmware_error_to_plr_error(
   error: STARFirmwareError,
 ) -> Optional[Exception]:
@@ -816,6 +833,10 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   @property
   def head96_installed(self) -> Optional[bool]:
     return self.extended_conf.left_x_drive.core_96_head_installed
+
+  @property
+  def head384_installed(self) -> Optional[bool]:
+    return self.extended_conf.left_x_drive.dispensing_head_384_installed
 
   @property
   def unsafe(self) -> "UnSafe":
@@ -4545,6 +4566,47 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       tv=f"{maximum_tip_volume:05}",
       tg=tip_size.value,
       tu=pickup_method.value,
+    )
+
+  async def define_tip_384(
+    self,
+    tip_type_table_index: int,
+    filtered: bool,
+    length_mm: float,
+    max_volume_ul: float,
+    collar_type: int,
+    pick_up_from_wash_liquid: bool = False,
+  ):
+    """Define a tip type for 384-head use (TT).
+
+    TT is generic across all channel types, not 384-specific -- but collar type 6 (CoRe 384
+    head tip, Hamilton) has no `TipSize` equivalent, so `define_tip_needle` cannot express it.
+    This exists to register it directly. See Table 3, spec E2891001a.
+
+    Args:
+      tip_type_table_index: Index into the tip type table.
+      filtered: Whether the tip has a filter.
+      length_mm: Tip length [mm].
+      max_volume_ul: Maximum volume of the tip [ul].
+      collar_type: Type of tip collar. 6 = CoRe 384 head tip (Hamilton).
+      pick_up_from_wash_liquid: Whether the pick-up method is out of wash liquid rather than
+        out of a rack.
+    """
+
+    assert 0 <= tip_type_table_index <= 99, "tip_type_table_index must be between 0 and 99"
+    assert 0.1 <= length_mm <= 199.9, "length_mm must be between 0.1 and 199.9"
+    assert 0.1 <= max_volume_ul <= 5600.0, "max_volume_ul must be between 0.1 and 5600.0"
+    assert 0 <= collar_type <= 9, "collar_type must be between 0 and 9"
+
+    return await self.send_command(
+      module="C0",
+      command="TT",
+      tt=f"{tip_type_table_index:02}",
+      tf=int(filtered),
+      tl=f"{round(length_mm * 10):04}",
+      tv=f"{round(max_volume_ul * 10):05}",
+      tg=collar_type,
+      tu=int(pick_up_from_wash_liquid),
     )
 
   # -------------- 3.2.1 System query --------------
@@ -9327,15 +9389,720 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   # -------------- 3.11.1 Initialization --------------
 
+  @need_iswap_parked
+  @_requires_head384
+  async def initialize_core_384_head(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    z_deposit_position: int,
+    z_position_at_end: int,
+  ):
+    """Initialize the 384 head, discarding any tips at the given position (JI).
+
+    The position arguments describe where tips are deposited during the reference run, not
+    where the head comes to rest. They are instrument- and deck-specific and have no
+    meaningful defaults.
+
+    Args:
+      x_position: X position of tip A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Y position of tip A1 [0.1 mm]. Must be between 1100 and 5640.
+      z_deposit_position: Z deposit position, the collar bearing position [0.1 mm].
+      z_position_at_end: Z position at the end of the command [0.1 mm].
+    """
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= z_deposit_position <= 3270, "z_deposit_position must be between 0 and 3270"
+    assert 0 <= z_position_at_end <= 3270, "z_position_at_end must be between 0 and 3270"
+
+    return await self.send_command(
+      module="C0",
+      command="JI",
+      read_timeout=60,
+      xs=f"{x_position:05}",
+      xd=x_direction,
+      yk=f"{y_position:04}",
+      je=f"{z_deposit_position:04}",
+      zg=f"{z_position_at_end:04}",
+    )
+
+  async def request_core_384_head_initialization_status(self) -> bool:
+    # not available in the C0 docs, so get from module D0 itself instead
+    response = await self.send_command(module="D0", command="QW", fmt="qw#")
+    return bool(response.get("qw", 0) == 1)
+
+  @need_iswap_parked
+  @_requires_head384
+  async def head384_move_to_z_safety(self):
+    """Move the 384 head to its Z safety position (JV)."""
+    return await self.send_command(module="C0", command="JV")
+
   # -------------- 3.11.2 Tip handling using 384 Head --------------
+
+  @need_iswap_parked
+  @_requires_head384
+  async def pick_up_tips_core384(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    tip_type_table_index: int,
+    z_pick_up_position: int,
+    minimum_traverse_height_at_beginning_of_a_command: int,
+    minimum_height_at_command_end: int,
+    pick_up_method: int = 0,
+    centering: bool = True,
+  ):
+    """Pick up tips with the 384 head (JB).
+
+    `tip_type_table_index` indexes the instrument's tip type table, which
+    `define_tip_needle`/`define_tip_384` populate and which a power cycle resets to the
+    firmware defaults.
+
+    Args:
+      x_position: X position of tip A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      tip_type_table_index: Index into the tip type table.
+      z_pick_up_position: Z pick up position, the collar bearing position [0.1 mm].
+      minimum_traverse_height_at_beginning_of_a_command: Minimal traverse height [0.1 mm].
+      minimum_height_at_command_end: Minimal height at command end [0.1 mm].
+      pick_up_method: 0 = from rack, 1 = from the CoRe 384 tip wash station,
+        2 = with full volume blowout.
+      centering: Whether the centering move is performed during pick up.
+    """
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= tip_type_table_index <= 99, "tip_type_table_index must be between 0 and 99"
+    assert 0 <= z_pick_up_position <= 3270, "z_pick_up_position must be between 0 and 3270"
+    assert 0 <= minimum_traverse_height_at_beginning_of_a_command <= 3270, (
+      "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+    assert 0 <= minimum_height_at_command_end <= 3270, (
+      "minimum_height_at_command_end must be between 0 and 3270"
+    )
+    assert 0 <= pick_up_method <= 2, "pick_up_method must be between 0 and 2"
+
+    return await self.send_command(
+      module="C0",
+      command="JB",
+      xs=f"{x_position:05}",
+      xd=x_direction,
+      yk=f"{y_position:04}",
+      tt=f"{tip_type_table_index:02}",
+      iu=pick_up_method,
+      je=f"{z_pick_up_position:04}",
+      zf=f"{minimum_traverse_height_at_beginning_of_a_command:04}",
+      zg=f"{minimum_height_at_command_end:04}",
+      ii=int(centering),
+    )
+
+  @need_iswap_parked
+  @_requires_head384
+  async def discard_tips_core384(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    z_deposit_position: int,
+    minimum_traverse_height_at_beginning_of_a_command: int,
+    minimum_height_at_command_end: int,
+    discard_method: int = 0,
+  ):
+    """Discard tips, or the tip tool, with the 384 head (JC).
+
+    Args:
+      x_position: X position of well A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      z_deposit_position: Z deposit position, the collar bearing position [0.1 mm].
+      minimum_traverse_height_at_beginning_of_a_command: Minimal traverse height [0.1 mm].
+      minimum_height_at_command_end: Minimal height at command end [0.1 mm].
+      discard_method: 0 = discard tips, 1 = discard tool.
+    """
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= z_deposit_position <= 3270, "z_deposit_position must be between 0 and 3270"
+    assert 0 <= minimum_traverse_height_at_beginning_of_a_command <= 3270, (
+      "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+    assert 0 <= minimum_height_at_command_end <= 3270, (
+      "minimum_height_at_command_end must be between 0 and 3270"
+    )
+    assert 0 <= discard_method <= 1, "discard_method must be between 0 and 1"
+
+    return await self.send_command(
+      module="C0",
+      command="JC",
+      xs=f"{x_position:05}",
+      xd=x_direction,
+      yk=f"{y_position:04}",
+      je=f"{z_deposit_position:04}",
+      zf=f"{minimum_traverse_height_at_beginning_of_a_command:04}",
+      zg=f"{minimum_height_at_command_end:04}",
+      jd=discard_method,
+    )
 
   # -------------- 3.11.3 Liquid handling using 384 Head --------------
 
+  @need_iswap_parked
+  @_requires_head384
+  async def aspirate_core_384(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    minimum_traverse_height_at_beginning_of_a_command: int,
+    minimum_height_at_command_end: int,
+    liquid_surface_no_lld: int,
+    minimum_height: int,
+    aspiration_volume: int,
+    aspiration_type: int = 0,
+    lld_search_height: int = 3270,
+    pull_out_distance_transport_air: int = 50,
+    second_section_height: int = 0,
+    second_section_ratio: int = 0,
+    immersion_depth: int = 0,
+    immersion_depth_direction: int = 0,
+    surface_following_distance: int = 0,
+    aspiration_speed: int = 2000,
+    transport_air_volume: int = 0,
+    blow_out_air_volume: int = 100,
+    pre_wetting_volume: int = 0,
+    lld_mode: int = 1,
+    gamma_lld_sensitivity: int = 1,
+    swap_speed: int = 100,
+    settling_time: int = 0,
+    homogenization_volume: int = 0,
+    homogenization_cycles: int = 0,
+    homogenization_position_from_liquid_surface: int = 0,
+    homogenization_speed: int = 2000,
+    homogenization_surface_following_distance: int = 0,
+    capacitive_lld_gain: Optional[int] = None,
+    capacitive_lld_offset: Optional[int] = None,
+  ):
+    """Aspirate liquid with the 384 head (JA).
+
+    Args:
+      x_position: X position of well A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      minimum_traverse_height_at_beginning_of_a_command: Minimal traverse height [0.1 mm].
+      minimum_height_at_command_end: Minimal height at command end [0.1 mm].
+      liquid_surface_no_lld: Liquid surface when running without LLD [0.1 mm].
+      minimum_height: Minimum height, the maximum immersion depth [0.1 mm].
+      aspiration_volume: Aspiration volume [0.01 ul].
+      aspiration_type: 0 = simple, 1 = sequence, 2 = cup emptied.
+      lld_search_height: LLD search height [0.1 mm].
+      pull_out_distance_transport_air: Pull out distance to take transport air [0.1 mm].
+      second_section_height: Tube second section height measured from `minimum_height`
+        [0.1 mm].
+      second_section_ratio: Tube second section ratio.
+      immersion_depth: Immersion depth [0.1 mm].
+      immersion_depth_direction: 0 = go deeper, 1 = go up out of the liquid.
+      surface_following_distance: Liquid surface sink distance at the end of aspiration
+        [0.1 mm].
+      aspiration_speed: Aspiration speed [0.1 ul/s].
+      transport_air_volume: Transport air volume [0.01 ul].
+      blow_out_air_volume: Blow-out air volume [0.01 ul].
+      pre_wetting_volume: Pre-wetting volume [0.01 ul].
+      lld_mode: 0 = off, 1 = gamma.
+      gamma_lld_sensitivity: 1 = high, 4 = low.
+      swap_speed: Swap speed on leaving the liquid [0.1 mm/s].
+      settling_time: Settling time [0.1 s].
+      homogenization_volume: Homogenization volume [0.01 ul].
+      homogenization_cycles: Number of homogenization cycles.
+      homogenization_position_from_liquid_surface: Homogenization position in Z from the
+        liquid surface [0.1 mm].
+      homogenization_speed: Homogenization speed [0.1 ul/s].
+      homogenization_surface_following_distance: Surface following distance during
+        homogenization [0.1 mm].
+      capacitive_lld_gain: Capacitive LLD gain value [AD steps]. Omitted from the command when
+        None, which is what Venus sends.
+      capacitive_lld_offset: Capacitive LLD offset value [AD steps]. Omitted from the command
+        when None, which is what Venus sends.
+    """
+    assert 0 <= aspiration_type <= 2, "aspiration_type must be between 0 and 2"
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= minimum_traverse_height_at_beginning_of_a_command <= 3270, (
+      "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+    assert 0 <= minimum_height_at_command_end <= 3270, (
+      "minimum_height_at_command_end must be between 0 and 3270"
+    )
+    assert 0 <= lld_search_height <= 3270, "lld_search_height must be between 0 and 3270"
+    assert 0 <= liquid_surface_no_lld <= 3270, "liquid_surface_no_lld must be between 0 and 3270"
+    assert 0 <= pull_out_distance_transport_air <= 3270, (
+      "pull_out_distance_transport_air must be between 0 and 3270"
+    )
+    assert 0 <= minimum_height <= 3270, "minimum_height must be between 0 and 3270"
+    assert 0 <= second_section_height <= 3270, "second_section_height must be between 0 and 3270"
+    assert 0 <= second_section_ratio <= 10000, "second_section_ratio must be between 0 and 10000"
+    assert 0 <= immersion_depth <= 250, "immersion_depth must be between 0 and 250"
+    assert 0 <= immersion_depth_direction <= 1, "immersion_depth_direction must be 0 or 1"
+    assert 0 <= surface_following_distance <= 250, (
+      "surface_following_distance must be between 0 and 250"
+    )
+    assert 0 <= aspiration_volume <= 9400, "aspiration_volume must be between 0 and 9400"
+    assert 3 <= aspiration_speed <= 2400, "aspiration_speed must be between 3 and 2400"
+    assert 0 <= transport_air_volume <= 1000, "transport_air_volume must be between 0 and 1000"
+    assert 0 <= blow_out_air_volume <= 8760, "blow_out_air_volume must be between 0 and 8760"
+    assert 0 <= pre_wetting_volume <= 8760, "pre_wetting_volume must be between 0 and 8760"
+    assert 0 <= lld_mode <= 1, "lld_mode must be 0 or 1"
+    assert 1 <= gamma_lld_sensitivity <= 4, "gamma_lld_sensitivity must be between 1 and 4"
+    assert 3 <= swap_speed <= 1000, "swap_speed must be between 3 and 1000"
+    assert 0 <= settling_time <= 99, "settling_time must be between 0 and 99"
+    assert 0 <= homogenization_volume <= 8760, "homogenization_volume must be between 0 and 8760"
+    assert 0 <= homogenization_cycles <= 99, "homogenization_cycles must be between 0 and 99"
+    assert 0 <= homogenization_position_from_liquid_surface <= 250, (
+      "homogenization_position_from_liquid_surface must be between 0 and 250"
+    )
+    assert 3 <= homogenization_speed <= 2400, "homogenization_speed must be between 3 and 2400"
+    assert 0 <= homogenization_surface_following_distance <= 250, (
+      "homogenization_surface_following_distance must be between 0 and 250"
+    )
+    assert capacitive_lld_gain is None or 0 <= capacitive_lld_gain <= 1023, (
+      "capacitive_lld_gain must be between 0 and 1023"
+    )
+    assert capacitive_lld_offset is None or 0 <= capacitive_lld_offset <= 1023, (
+      "capacitive_lld_offset must be between 0 and 1023"
+    )
+
+    kwargs: Dict[str, Any] = {
+      "ja": aspiration_type,
+      "xs": f"{x_position:05}",
+      "xd": x_direction,
+      "yk": f"{y_position:04}",
+      "zf": f"{minimum_traverse_height_at_beginning_of_a_command:04}",
+      "zg": f"{minimum_height_at_command_end:04}",
+      "jz": f"{lld_search_height:04}",
+      "jt": f"{liquid_surface_no_lld:04}",
+      "jm": f"{minimum_height:04}",
+      "jw": f"{immersion_depth:03}",
+      "jx": immersion_depth_direction,
+      "jh": f"{surface_following_distance:03}",
+      "jf": f"{aspiration_volume:05}",
+      "jg": f"{aspiration_speed:04}",
+      "ju": f"{transport_air_volume:04}",
+      "jv": f"{blow_out_air_volume:05}",
+      "jy": f"{pre_wetting_volume:05}",
+      "jq": lld_mode,
+      "jp": gamma_lld_sensitivity,
+      "js": f"{swap_speed:04}",
+      "ji": f"{settling_time:02}",
+      "jj": f"{homogenization_volume:05}",
+      "jk": f"{homogenization_cycles:02}",
+      "jl": f"{homogenization_position_from_liquid_surface:03}",
+      "jn": f"{homogenization_speed:04}",
+      "zw": f"{second_section_height:04}",
+      "zs": f"{second_section_ratio:05}",
+      "mk": f"{homogenization_surface_following_distance:03}",
+      "pq": f"{pull_out_distance_transport_air:04}",
+    }
+    if capacitive_lld_gain is not None:
+      kwargs["ig"] = f"{capacitive_lld_gain:04}"
+    if capacitive_lld_offset is not None:
+      kwargs["ih"] = f"{capacitive_lld_offset:04}"
+
+    return await self.send_command(module="C0", command="JA", **kwargs)
+
+  @need_iswap_parked
+  @_requires_head384
+  async def dispense_core_384(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    minimum_traverse_height_at_beginning_of_a_command: int,
+    minimum_height_at_command_end: int,
+    liquid_surface_no_lld: int,
+    minimum_height: int,
+    dispense_volume: int,
+    dispensing_mode: int = 0,
+    second_section_height: int = 0,
+    second_section_ratio: int = 0,
+    lld_search_height: int = 3270,
+    pull_out_distance_transport_air: int = 50,
+    immersion_depth: int = 0,
+    immersion_depth_direction: int = 0,
+    surface_following_distance: int = 0,
+    dispense_speed: int = 2000,
+    cut_off_speed: int = 1500,
+    stop_back_volume: int = 0,
+    transport_air_volume: int = 0,
+    blow_out_air_volume: int = 0,
+    lld_mode: int = 1,
+    gamma_lld_sensitivity: int = 1,
+    side_touch_off_distance: int = 0,
+    swap_speed: int = 100,
+    settling_time: int = 0,
+    mix_volume: int = 0,
+    mix_cycles: int = 0,
+    mix_position_from_liquid_surface: int = 0,
+    mix_speed: int = 2000,
+    mix_surface_following_distance: int = 0,
+    capacitive_lld_gain: Optional[int] = None,
+    capacitive_lld_offset: Optional[int] = None,
+  ):
+    """Dispense liquid with the 384 head (JD).
+
+    Args:
+      x_position: X position of well A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      minimum_traverse_height_at_beginning_of_a_command: Minimal traverse height [0.1 mm].
+      minimum_height_at_command_end: Minimal height at command end [0.1 mm].
+      liquid_surface_no_lld: Liquid surface when running without LLD [0.1 mm].
+      minimum_height: Minimum height, the maximum immersion depth [0.1 mm].
+      dispense_volume: Dispense volume [0.01 ul].
+      dispensing_mode: 0 = partial volume in jet mode, 1 = blow out in jet mode, 2 = partial
+        volume at surface, 3 = blow out at surface, 4 = empty tip at fix position.
+      second_section_height: Tube second section height measured from `minimum_height`
+        [0.1 mm].
+      second_section_ratio: Tube second section ratio.
+      lld_search_height: LLD search height [0.1 mm].
+      pull_out_distance_transport_air: Pull out distance to take transport air [0.1 mm].
+      immersion_depth: Immersion depth [0.1 mm].
+      immersion_depth_direction: 0 = go deeper, 1 = go up out of the liquid.
+      surface_following_distance: Liquid surface elevation distance at the end of the
+        dispense [0.1 mm].
+      dispense_speed: Dispense speed [0.1 ul/s].
+      cut_off_speed: Cut-off speed [0.1 ul/s].
+      stop_back_volume: Stop back volume [0.01 ul].
+      transport_air_volume: Transport air volume [0.01 ul].
+      blow_out_air_volume: Blow-out air volume [0.01 ul].
+      lld_mode: 0 = off, 1 = gamma.
+      gamma_lld_sensitivity: 1 = high, 4 = low.
+      side_touch_off_distance: Side touch off distance [0.1 mm]. A value above 0 turns LLD
+        off.
+      swap_speed: Swap speed on leaving the liquid [0.1 mm/s].
+      settling_time: Settling time [0.1 s].
+      mix_volume: Mix volume [0.01 ul].
+      mix_cycles: Number of mix cycles.
+      mix_position_from_liquid_surface: Mix position in Z from the liquid surface [0.1 mm].
+      mix_speed: Mix speed [0.1 ul/s].
+      mix_surface_following_distance: Surface following distance during mixing [0.1 mm].
+      capacitive_lld_gain: Capacitive LLD gain value [AD steps]. Omitted from the command when
+        None, which is what Venus sends.
+      capacitive_lld_offset: Capacitive LLD offset value [AD steps]. Omitted from the command
+        when None, which is what Venus sends.
+    """
+    assert 0 <= dispensing_mode <= 4, "dispensing_mode must be between 0 and 4"
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= minimum_height <= 3270, "minimum_height must be between 0 and 3270"
+    assert 0 <= second_section_height <= 3270, "second_section_height must be between 0 and 3270"
+    assert 0 <= second_section_ratio <= 10000, "second_section_ratio must be between 0 and 10000"
+    assert 0 <= lld_search_height <= 3270, "lld_search_height must be between 0 and 3270"
+    assert 0 <= liquid_surface_no_lld <= 3270, "liquid_surface_no_lld must be between 0 and 3270"
+    assert 0 <= pull_out_distance_transport_air <= 3270, (
+      "pull_out_distance_transport_air must be between 0 and 3270"
+    )
+    assert 0 <= immersion_depth <= 250, "immersion_depth must be between 0 and 250"
+    assert 0 <= immersion_depth_direction <= 1, "immersion_depth_direction must be 0 or 1"
+    assert 0 <= surface_following_distance <= 250, (
+      "surface_following_distance must be between 0 and 250"
+    )
+    assert 0 <= minimum_traverse_height_at_beginning_of_a_command <= 3270, (
+      "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+    assert 0 <= minimum_height_at_command_end <= 3270, (
+      "minimum_height_at_command_end must be between 0 and 3270"
+    )
+    assert 0 <= dispense_volume <= 8760, "dispense_volume must be between 0 and 8760"
+    assert 3 <= dispense_speed <= 2400, "dispense_speed must be between 3 and 2400"
+    assert 3 <= cut_off_speed <= 2400, "cut_off_speed must be between 3 and 2400"
+    assert 0 <= stop_back_volume <= 2000, "stop_back_volume must be between 0 and 2000"
+    assert 0 <= transport_air_volume <= 1000, "transport_air_volume must be between 0 and 1000"
+    assert 0 <= blow_out_air_volume <= 8760, "blow_out_air_volume must be between 0 and 8760"
+    assert 0 <= lld_mode <= 1, "lld_mode must be 0 or 1"
+    assert 1 <= gamma_lld_sensitivity <= 4, "gamma_lld_sensitivity must be between 1 and 4"
+    assert 0 <= side_touch_off_distance <= 90, "side_touch_off_distance must be between 0 and 90"
+    assert 3 <= swap_speed <= 1000, "swap_speed must be between 3 and 1000"
+    assert 0 <= settling_time <= 99, "settling_time must be between 0 and 99"
+    assert 0 <= mix_volume <= 8760, "mix_volume must be between 0 and 8760"
+    assert 0 <= mix_cycles <= 99, "mix_cycles must be between 0 and 99"
+    assert 0 <= mix_position_from_liquid_surface <= 250, (
+      "mix_position_from_liquid_surface must be between 0 and 250"
+    )
+    assert 3 <= mix_speed <= 2400, "mix_speed must be between 3 and 2400"
+    assert 0 <= mix_surface_following_distance <= 250, (
+      "mix_surface_following_distance must be between 0 and 250"
+    )
+    assert capacitive_lld_gain is None or 0 <= capacitive_lld_gain <= 1023, (
+      "capacitive_lld_gain must be between 0 and 1023"
+    )
+    assert capacitive_lld_offset is None or 0 <= capacitive_lld_offset <= 1023, (
+      "capacitive_lld_offset must be between 0 and 1023"
+    )
+
+    kwargs: Dict[str, Any] = {
+      "jo": dispensing_mode,
+      "xs": f"{x_position:05}",
+      "xd": x_direction,
+      "yk": f"{y_position:04}",
+      "jm": f"{minimum_height:04}",
+      "jz": f"{lld_search_height:04}",
+      "jt": f"{liquid_surface_no_lld:04}",
+      "jw": f"{immersion_depth:03}",
+      "jx": immersion_depth_direction,
+      "jh": f"{surface_following_distance:03}",
+      "zf": f"{minimum_traverse_height_at_beginning_of_a_command:04}",
+      "zg": f"{minimum_height_at_command_end:04}",
+      "jb": f"{dispense_volume:05}",
+      "jc": f"{dispense_speed:04}",
+      "jr": f"{cut_off_speed:04}",
+      "im": f"{stop_back_volume:04}",
+      "ju": f"{transport_air_volume:04}",
+      "jv": f"{blow_out_air_volume:05}",
+      "jq": lld_mode,
+      "jp": gamma_lld_sensitivity,
+      "js": f"{swap_speed:04}",
+      "ji": f"{settling_time:02}",
+      "jj": f"{mix_volume:05}",
+      "jk": f"{mix_cycles:02}",
+      "jl": f"{mix_position_from_liquid_surface:03}",
+      "jn": f"{mix_speed:04}",
+      "zw": f"{second_section_height:04}",
+      "ij": f"{side_touch_off_distance:02}",
+      "zs": f"{second_section_ratio:05}",
+      "mk": f"{mix_surface_following_distance:03}",
+      "pq": f"{pull_out_distance_transport_air:04}",
+    }
+    if capacitive_lld_gain is not None:
+      kwargs["ig"] = f"{capacitive_lld_gain:04}"
+    if capacitive_lld_offset is not None:
+      kwargs["ih"] = f"{capacitive_lld_offset:04}"
+
+    return await self.send_command(module="C0", command="JD", **kwargs)
+
   # -------------- 3.11.4 Adjustment & movement commands --------------
+
+  @_requires_head384
+  async def move_core_384_head_to_defined_position(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    z_position: int,
+    minimum_height_at_beginning_of_a_command: int,
+  ):
+    """Move the 384 head to a defined position (EN).
+
+    Args:
+      x_position: X position of tip A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      z_position: Z position [0.1 mm].
+      minimum_height_at_beginning_of_a_command: Minimal height at command start [0.1 mm].
+    """
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= z_position <= 3270, "z_position must be between 0 and 3270"
+    assert 0 <= minimum_height_at_beginning_of_a_command <= 3270, (
+      "minimum_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+
+    return await self.send_command(
+      module="C0",
+      command="EN",
+      xs=f"{x_position:05}",
+      xd=x_direction,
+      yk=f"{y_position:04}",
+      je=f"{z_position:04}",
+      zf=f"{minimum_height_at_beginning_of_a_command:04}",
+    )
+
+  @_requires_head384
+  async def safety_move_core_384_head_to_y(
+    self,
+    y_position: int,
+    minimum_height_at_beginning_of_a_command: int,
+  ):
+    """Move the 384 head to a Y position only (EY).
+
+    Args:
+      y_position: Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      minimum_height_at_beginning_of_a_command: Minimal height at command start [0.1 mm].
+    """
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= minimum_height_at_beginning_of_a_command <= 3270, (
+      "minimum_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+
+    return await self.send_command(
+      module="C0",
+      command="EY",
+      yk=f"{y_position:04}",
+      zf=f"{minimum_height_at_beginning_of_a_command:04}",
+    )
 
   # -------------- 3.11.5 Wash procedure commands using 384 Head --------------
 
+  @need_iswap_parked
+  @_requires_head384
+  async def wash_tips_core384(
+    self,
+    x_position: int,
+    x_direction: int,
+    y_position: int,
+    wash_z_position: int,
+    minimum_height: int,
+    minimum_traverse_height_at_beginning_of_a_command: int,
+    wash_volume: int,
+    wash_cycles: int,
+    surface_following_distance: int = 0,
+    wash_speed: int = 2000,
+  ):
+    """Wash tips with the 384 head (JG).
+
+    TODO(hardware): field widths only, not yet run against real hardware -- the instrument this
+    was developed on has no CoRe 384 tip wash station installed, so there is no captured
+    command to pin this to.
+
+    Args:
+      x_position: Wash X position of well A1 [0.1 mm], as an absolute value.
+      x_direction: Sign of the X position. 0 = positive, 1 = negative.
+      y_position: Wash Y position of well A1 [0.1 mm]. Must be between 1100 and 5640.
+      wash_z_position: Wash Z position [0.1 mm].
+      minimum_height: Minimum height, the maximum immersion depth [0.1 mm].
+      minimum_traverse_height_at_beginning_of_a_command: Minimal traverse height [0.1 mm].
+      wash_volume: Wash volume [0.01 ul].
+      wash_cycles: Number of wash cycles.
+      surface_following_distance: Surface following distance during mixing [0.1 mm].
+      wash_speed: Wash speed [0.1 ul/s].
+    """
+    assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
+    assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
+    assert 1100 <= y_position <= 5640, "y_position must be between 1100 and 5640"
+    assert 0 <= wash_z_position <= 3270, "wash_z_position must be between 0 and 3270"
+    assert 0 <= minimum_height <= 3270, "minimum_height must be between 0 and 3270"
+    assert 0 <= surface_following_distance <= 250, (
+      "surface_following_distance must be between 0 and 250"
+    )
+    assert 0 <= minimum_traverse_height_at_beginning_of_a_command <= 3270, (
+      "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3270"
+    )
+    assert 0 <= wash_volume <= 8760, "wash_volume must be between 0 and 8760"
+    assert 0 <= wash_cycles <= 99, "wash_cycles must be between 0 and 99"
+    assert 3 <= wash_speed <= 2400, "wash_speed must be between 3 and 2400"
+
+    return await self.send_command(
+      module="C0",
+      command="JG",
+      xs=f"{x_position:05}",
+      xd=x_direction,
+      yk=f"{y_position:04}",
+      jt=f"{wash_z_position:04}",
+      jm=f"{minimum_height:04}",
+      jh=f"{surface_following_distance:03}",
+      zf=f"{minimum_traverse_height_at_beginning_of_a_command:04}",
+      jj=f"{wash_volume:05}",
+      jk=f"{wash_cycles:02}",
+      jn=f"{wash_speed:04}",
+    )
+
+  @need_iswap_parked
+  @_requires_head384
+  async def empty_washed_tips_core384(
+    self,
+    z_position: int,
+    minimum_height_at_command_end: int,
+  ):
+    """Empty washed tips at the end of a 384-head wash procedure (JU).
+
+    TODO(hardware): field widths only, not yet run against real hardware -- the instrument this
+    was developed on has no CoRe 384 tip wash station installed, so there is no captured
+    command to pin this to.
+
+    Args:
+      z_position: Z position [0.1 mm].
+      minimum_height_at_command_end: Minimal height at command end [0.1 mm].
+    """
+    assert 0 <= z_position <= 3270, "z_position must be between 0 and 3270"
+    assert 0 <= minimum_height_at_command_end <= 3270, (
+      "minimum_height_at_command_end must be between 0 and 3270"
+    )
+
+    return await self.send_command(
+      module="C0",
+      command="JU",
+      jt=f"{z_position:04}",
+      zg=f"{minimum_height_at_command_end:04}",
+    )
+
   # -------------- 3.11.6 Query 384 Head --------------
+
+  async def request_tip_presence_in_core_384_head(self) -> bool:
+    """Request tip presence in the 384 head (QK).
+
+    The firmware reports tips present on a head whose state it has not established, so the
+    value is only meaningful once the head has been initialized.
+
+    Returns:
+      Whether the firmware reports tips on the head.
+    """
+    resp = await self.send_command(module="C0", command="QK", fmt="qk#")
+    return cast(int, resp["qk"]) == 1
+
+  async def request_position_of_core_384_head(self):
+    """Request the position of the 384 head at A1, accounting for tip length (QJ).
+
+    Returns:
+      The parsed firmware response with keys `xs`, `xd`, `yk` and `je`.
+    """
+    return await self.send_command(
+      module="C0",
+      command="QJ",
+      fmt="xs#####xd#yk####je####",
+    )
+
+  async def head384_request_type(self) -> int:
+    """Request the type of the installed 384 head (QY).
+
+    Returns:
+      0 = low volume, 1 = high volume, 2 = shifted tip pickup.
+    """
+    resp = await self.send_command(module="C0", command="QY", fmt="qy#")
+    return cast(int, resp["qy"])
+
+  async def head384_request_firmware_version(self) -> Tuple[str, datetime.date]:
+    """Request the 384 head's own module firmware version and build date (RF).
+
+    Mirrors `head96_request_firmware_version` (`H0 RF`), addressed to the 384 head's own
+    module, `D0`. Confirmed against real hardware: the raw response is of the form
+    `"D0RFid0001rf1.4S b 2015-10-07"` -- an `rf` field carrying the free-text version tag
+    and build date together, space-separated, with no fixed width. The version is everything
+    before the date; the date is extracted with the same regex-based helper
+    `_parse_firmware_version_datetime` uses, so it does not depend on the version text's shape.
+
+    Returns:
+      A tuple of (version_string, build_date), e.g. ("1.4S b", date(2015, 10, 7)).
+    """
+    resp: str = await self.send_command(module="D0", command="RF")
+    value = resp.split("rf", 1)[-1]
+    date_match = re.search(r"\b20\d{2}[._-]\d{2}[._-]\d{2}\b", value)
+    version = value[: date_match.start()].strip() if date_match else value.strip()
+    build_date = self._parse_firmware_version_datetime(resp)
+    return version, build_date
+
+  # TODO(hardware): dispensing-drive position request (`D0 RD`, mirroring `head96_..._request_
+  # position_mm`'s `H0 RD`) is not implemented. Confirmed to exist -- a real 384 head answers
+  # `D0RD` with two signed 5-digit values (e.g. "+06512 +06512") -- but not what it means: two
+  # independent drives, one value duplicated, or something else. Not documented in the C0-level
+  # spec (section 3.12.6 only covers QK/QJ/QY), and the one real sample was a single idle-state
+  # reading with nothing to compare it against. Needs a second reading at a different, known
+  # dispensing-drive position (e.g. mid-aspirate) to see whether the two values move together or
+  # independently, before this can be implemented without guessing the response's field layout.
 
   # -------------- 3.12 Nano pipettor commands --------------
 
