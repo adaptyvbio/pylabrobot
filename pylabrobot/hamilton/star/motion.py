@@ -550,6 +550,23 @@ def _core_tool_return(frames: _Frames, command: str, params: Dict[str, Any]) -> 
   return _hold_at_bottom(request, CORE_TOOL_RETURN_FIXED)
 
 
+def _at_the_grip(
+  frames: _Frames, back: int, front: int, params: Dict[str, Any], location: Coordinate
+) -> Coordinate:
+  """Where a gripped plate hangs from the front tool once the fingers have closed on it.
+
+  `CoreGrippers` works out the hang before `C0 ZP` is sent, from where the channels stand then -
+  as the tools were picked up. The plate hangs centred between the channels, from the tool on the
+  front one: its Y on that tool is half the channels' spacing behind the front channel. At the
+  bottom of the grip the channels stand the closed width `yg` apart, either side of the plate's
+  centre, as the device reports them (`STARSimulationDriver._held_pair_ys`). X and Z ride with the
+  tool and do not change.
+  """
+  half_now = (frames.current_y(back) - frames.current_y(front)) / 2
+  half_at_grip = (int(params["yg"]) // 2) / 10
+  return location + Coordinate(0, half_at_grip - half_now, 0)
+
+
 def _core_plate(frames: _Frames, command: str, params: Dict[str, Any], kind: str) -> Dict[str, Any]:
   """`C0 ZP`, `ZM`, `ZR`: the two tool channels travel, go down to the grip line at the plate's
   centre, one on each side of it, and come up. At the bottom of a grip the plate passes to the
@@ -583,6 +600,8 @@ def _core_plate(frames: _Frames, command: str, params: Dict[str, Any], kind: str
   )
   if handover and kind != "core_move":
     resource, parent, location = handover
+    if kind == "core_grip" and location is not None:
+      location = _at_the_grip(frames, back, front, params, location)
     request["attach"].append(
       {
         "name": resource.name,

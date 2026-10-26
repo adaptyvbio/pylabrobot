@@ -28,6 +28,7 @@ from pylabrobot.hamilton.star.motion import (
   attach_viewer_motion,
   star_motion,
 )
+from pylabrobot.resources.coordinate import Coordinate
 from pylabrobot.resources.plate import Plate
 from pylabrobot.resources.tip_rack import TipRack
 from pylabrobot.resources.tip_tracking import does_tip_tracking, set_tip_tracking
@@ -136,6 +137,40 @@ class DecoderTests(unittest.IsolatedAsyncioTestCase):
     for handover, tip in zip(drop["attach"], tips):
       for axis in "xyz":
         self.assertAlmostEqual(handover["location"][axis], getattr(tip.location, axis), 6)
+
+  async def test_a_core_grip_hands_the_plate_over_where_the_model_then_hangs_it(self):
+    """Where the fingers close on it, not where the tools were picked up: the channels' spacing
+    changes during the grip, and the plate hangs from the front tool."""
+    grippers = self.star.core_grippers
+    await grippers.pick_up_tools(front_channel=7)
+    self.requests.clear()
+    await grippers.pick_up_resource(self.source, pickup_distance_from_top=5)
+    grip = next(r for r in self.requests if r["kind"] == "core_grip")
+    (handover,) = grip["attach"]
+    self.assertEqual(handover["name"], self.source.name)
+    self.assertEqual(handover["parent"], self.source.parent.name)
+    for axis in "xyz":
+      self.assertAlmostEqual(
+        handover["location"][axis], getattr(self.source.location, axis), delta=0.01, msg=axis
+      )
+
+  async def test_a_core_release_onto_a_coordinate_hands_the_plate_to_the_deck_where_it_lands(self):
+    grippers = self.star.core_grippers
+    await grippers.pick_up_tools(front_channel=7)
+    await grippers.pick_up_resource(self.source, pickup_distance_from_top=5)
+    # A free stretch of deck: the carrier standing there is taken away.
+    self.star.deck.get_resource("ntr_carrier").unassign()
+    self.requests.clear()
+    await grippers.place_resource(Coordinate(572, 300, 100))
+    release = next(r for r in self.requests if r["kind"] == "core_release")
+    (handover,) = release["attach"]
+    self.assertEqual(handover["name"], self.source.name)
+    self.assertEqual(self.source.parent, self.star.deck)
+    self.assertEqual(handover["parent"], self.star.deck.name)
+    for axis in "xyz":
+      self.assertAlmostEqual(
+        handover["location"][axis], getattr(self.source.location, axis), delta=0.01, msg=axis
+      )
 
   async def test_a_dropped_tip_is_let_go_of_down_in_its_spot(self):
     """`DROP` heights are the stop disc's: taken as the tip's bottom, the channel stops a tip's
