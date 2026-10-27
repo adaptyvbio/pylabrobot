@@ -67,6 +67,12 @@ export const stateOf = new Map();
 
 export const hiddenNames = new Set();
 
+// Tips a motion has discarded into the waste: out of the model's tree, so out of the scene, until
+// the next scene - which has them no more, or, in a replay, wherever PyLabRobot has them. Drawn
+// nowhere, as a hidden resource is, but not a choice of the reader's: the eye does not bring them
+// back.
+export const discardedNames = new Set();
+
 // What counts as ground rather than as an object standing on it.
 export const GROUND = new Set(["facility", "deck"]);
 
@@ -191,7 +197,7 @@ export function remember(index, mesh, slot, at, emptyOnly = false) {
 // a parent is off".
 export function isVisible(index) {
   for (let i = index; i >= 0; i = world.parentOf[i]) {
-    if (hiddenNames.has(world.names[i])) return false;
+    if (hiddenNames.has(world.names[i]) || discardedNames.has(world.names[i])) return false;
   }
   return true;
 }

@@ -484,6 +484,32 @@ test("a tip is handed over where it stands, then seated where the model gives it
   assert.ok(seating.length > 2, "the tip jumped to its seat instead of moving there");
 });
 
+test("a tip dropped in the waste is discarded at the bottom of the stroke, not left standing", async () => {
+  const world = fakeWorld(start());
+  const deps = world.deps();
+  const discarded = [];
+  deps.discard = (name, holder) =>
+    discarded.push({ name, holder, z: world.at("ch0")[2], y: world.at("ch0")[1] });
+  const drop = {
+    ...pickUp,
+    kind: "tip_drop",
+    attach: [{ name: "tip", holder: "shaft0", parent: null, location: null, discard: true }],
+    dwell: 0.5,
+  };
+  await playOut(createPlayer(deps), drop);
+  // Removed at the bottom, once across and down, and never handed to anything.
+  assert.deepEqual(discarded, [{ name: "tip", holder: "shaft0", z: -100, y: 200 }]);
+  assert.equal(world.log.filter((e) => e.attach).length, 0, "the discarded tip was handed over");
+  // A replay's model never had the tip on the shaft: the page discards whatever the shaft has.
+  const fromReplay = { ...drop, attach: [{ ...drop.attach[0], name: null }] };
+  discarded.length = 0;
+  await playOut(createPlayer(deps), fromReplay);
+  assert.deepEqual(
+    discarded.map(({ name, holder }) => ({ name, holder })),
+    [{ name: null, holder: "shaft0" }],
+  );
+});
+
 test("a dispense goes down, dwells for its volume, leaves at its swap speed and comes up", async () => {
   const world = fakeWorld({ arm: [300, 0, 0], ch0: [0, 200, 10] });
   const dispense = {

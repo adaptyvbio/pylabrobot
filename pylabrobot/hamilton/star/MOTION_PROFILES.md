@@ -67,7 +67,7 @@ Profile: **stroke with handover**.
 |---|---|---|---|
 | 1–2 | As `C0 TP` | FW + SIM | |
 | 3. Down | `tz`. With `ti=1` (DROP) this is the stop disc's height; with PLACE_SHIFT it is where the tip's cone ends | PLR | `_unchecked_fw_drop_tips` docstring: "With `PLACE_SHIFT` the heights are where the tip's cone ends; with `DROP`, the stop disc's." |
-| 4. Handover | The tip goes to the spot under the channel (placed by `resting_location`), or nowhere (waste) | PLR | `tip_rack.resting_location`. |
+| 4. Handover | The tip goes to the spot under the channel (placed by `resting_location`), or, over somewhere that is not a spot (the waste), is discarded: the page takes it out of the scene there, as the model takes it out of the tree (`discard`, with the shaft as `holder`, so a replay, whose model never has tips on shafts, discards whatever the shaft carries) | PLR | `tip_rack.resting_location`; `Pipettes.drop_tips`: "one dropped anywhere else belongs to nothing". |
 | 5. Up | To `te`, empty | FW | |
 
 Default heights: DROP begins at spot + collar and ends a fitting depth lower; PLACE_SHIFT uses 59.9 / 49.9 mm (PLR, legacy "Empirical, from legacy: https://github.com/PyLabRobot/pylabrobot/pull/63").

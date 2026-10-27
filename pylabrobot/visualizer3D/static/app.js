@@ -3,7 +3,15 @@ import { forgetDetail, updateDetail, updateEdgeMode } from "./appearance.js";
 import { buildMeshes } from "./boxes.js";
 import { PROTOCOL } from "./constants.js";
 import { initDeviceTools } from "./device_tools.js";
-import { hiddenNames, meshes, meshRoots, modelMeshes, stateOf, worldBox } from "./drawn.js";
+import {
+  hiddenNames,
+  isVisible,
+  meshes,
+  meshRoots,
+  modelMeshes,
+  stateOf,
+  worldBox,
+} from "./drawn.js";
 import { niceNumber } from "./format.js";
 import {
   afterDraw,
@@ -205,6 +213,16 @@ function atBoundary(surface) {
   pickAt: (clientX, clientY) => {
     const hit = world ? pick({ clientX, clientY }) : null;
     return hit ? world.names[hit.index] : null;
+  },
+  // Whether a resource is drawn at all, and what the page has it held by (null for nothing).
+  shown: (name) => {
+    const index = world?.indexOfName.get(name);
+    return index !== undefined && isVisible(index);
+  },
+  holderOf: (name) => {
+    const index = world?.indexOfName.get(name);
+    const parent = index === undefined ? -1 : world.parentOf[index];
+    return parent < 0 ? null : world.names[parent];
   },
   // Where a resource is drawn, in facility coordinates. The one thing a test outside the page
   // cannot work out for itself, because it is the product of the whole parent chain.

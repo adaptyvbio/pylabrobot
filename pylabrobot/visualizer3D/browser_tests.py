@@ -858,6 +858,41 @@ class SimulationTests(unittest.IsolatedAsyncioTestCase):
     finally:
       await viewer.stop()
 
+  async def test_a_tip_dropped_in_the_waste_leaves_the_page_at_the_bottom_of_the_stroke(self):
+    """Handed to nothing, a tip let go of in the waste stayed drawn: standing in the waste until
+    the next scene in a live run, and on the channel in a replay, whose model never has tips on
+    shafts. A discard takes it out of the page then and there, whatever the shaft carries."""
+    was_tracking = does_tip_tracking()
+    set_tip_tracking(True)
+    self.addCleanup(set_tip_tracking, was_tracking)
+    facility = build_facility()
+    star = star_of(facility)
+    await star.setup()
+    fs_port, ws_port = free_ports(2)
+    viewer = Viewer3D(facility, open_browser=False, fs_port=fs_port, ws_port=ws_port)
+    await viewer.start()
+    try:
+      async with Browser() as browser:
+        page, _, token = viewer.url.partition("#")
+        await browser.open(f"{page}?motion=0#{token}")  # motions jump, so nothing waits on frames
+        await browser.settle("window.plrViewer && window.plrViewer.resources().length > 3000", 60)
+        rack = star.deck.get_resource("tips_0")
+        assert isinstance(rack, TipRack) and star.pipettes is not None
+        tip = rack.get_item("A1").tip
+        assert tip is not None
+        await star.pipettes.pick_up_tips([rack.get_item("A1")])
+        shaft = tip.parent
+        assert shaft is not None
+        await browser.settle(f"window.plrViewer.holderOf({tip.name!r}) === {shaft.name!r}", 30)
+        self.assertTrue(await browser.evaluate(f"window.plrViewer.shown({tip.name!r})"))
+        # As a replay sends it: the tip is not named, only the shaft that lets go of it.
+        handover = {"name": None, "holder": shaft.name, "parent": None, "discard": True}
+        await viewer.act_out("C0TR", {"kind": "tip_drop", "attach": [handover], "dwell": 0.1})
+        self.assertFalse(await browser.evaluate(f"window.plrViewer.shown({tip.name!r})"))
+        self.assertIsNone(await browser.evaluate(f"window.plrViewer.holderOf({tip.name!r})"))
+    finally:
+      await viewer.stop()
+
   async def test_a_tip_is_listed_by_what_holds_it(self):
     """A tip spot or a channel's shaft holds its tip as a child, and its panel said nothing of it:
     what it held, and what was in that, could only be read off the tree and the device tools."""

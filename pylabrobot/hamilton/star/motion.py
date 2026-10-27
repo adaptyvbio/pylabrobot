@@ -365,6 +365,23 @@ def _handover(tip: Any, parent: Any, location: Optional[Dict[str, float]]) -> Di
   }
 
 
+def _discard(tip: Optional[Any], holder: Any) -> Dict[str, Any]:
+  """A tip let go of over somewhere that is not a spot - the waste - at the bottom of a stroke.
+
+  It belongs to nothing after: the model takes it out of the tree, so the page takes it out of the
+  scene there. `holder` is the shaft that let go of it, so the page can discard whatever that shaft
+  carries when the model does not know the tip (a replay sends the firmware raw, and never puts
+  tips on shafts): `name` is then None.
+  """
+  return {
+    "name": None if tip is None else tip.name,
+    "holder": holder.name,
+    "parent": None,
+    "location": None,
+    "discard": True,
+  }
+
+
 def _positions(params: Dict[str, Any], channel: int) -> Any:
   return _tenths(_as_list(params["xp"])[channel]), _tenths(_as_list(params["yp"])[channel])
 
@@ -432,15 +449,18 @@ def _tip_drop(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str
   request["dwell"] = TIP_EJECT_HOLD
   request["fixed"] = round(TIP_DROP_FIXED - TIP_EJECT_HOLD, 3)
   # At the bottom of the stroke each channel leaves its tip in the spot under it, or, over
-  # somewhere that is not a spot - the waste - where it is.
+  # somewhere that is not a spot - the waste - discards it.
   for c in involved:
     shaft = frames.shaft(c)
-    if shaft is None or shaft.tip is None:
+    if shaft is None:
       continue
     spot = frames.spot_at(*_positions(params, c))
-    if spot is not None and spot.tip is None:
+    if spot is None:
+      request["attach"].append(_discard(shaft.tip, shaft))
+    elif shaft.tip is not None and spot.tip is None:
       request["attach"].append(_handover(shaft.tip, spot, _xyz(resting_location(spot, shaft.tip))))
-    else:
+    elif shaft.tip is not None:
+      # Over a spot that already holds a tip: left where it is let go of, as before.
       request["attach"].append(_handover(shaft.tip, None, None))
   return request
 
@@ -1096,7 +1116,7 @@ def _head96_tips(driver: Any, head: Any, command: str, params: Dict[str, Any]) -
           _handover(shaft.tip, spot, _xyz(resting_location(spot, shaft.tip)))
         )
       else:
-        request["attach"].append(_handover(shaft.tip, None, None))
+        request["attach"].append(_discard(shaft.tip, shaft))
 
   name = frames.resource.name
   request["traverse"] = [
@@ -1201,7 +1221,8 @@ def star_motion(
     targets - `y`, the heights `down` and `end`, and for an aspiration where it `leave`s the liquid
     and at what `leave_speed`; the height every channel rises to first (`traverse`); the tips that
     change hands at the bottom of the stroke (`attach`: a tip's name and the resource that takes
-    it, or None to leave it where it is); how long the stroke dwells at the bottom; the command's
+    it, or None to leave it where it is; a tip let go of in the waste is marked `discard`, with
+    the `holder` that let go of it, and leaves the scene there); how long the stroke dwells at the bottom; the command's
     `fixed` time beyond its motion; and the drives' speeds (the channels' Y with the `stagger` one
     channel starts after another). A tip pick-up's channels also `press` to a height at a
     `press_speed`. None for a command that moves nothing, or one this does not read.

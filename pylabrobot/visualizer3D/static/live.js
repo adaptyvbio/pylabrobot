@@ -6,6 +6,7 @@ import * as THREE from "three";
 import { placeEdges, showEdges } from "./boxes.js";
 import { DEG, LIQUID, MOVING_PARTS, VESSEL_EMPTY } from "./constants.js";
 import {
+  discardedNames,
   hiddenNames,
   isVisible,
   meshRoots,
@@ -324,7 +325,11 @@ export function setHidden(name, hidden) {
   else hiddenNames.delete(name);
   const root = world.indexOfName.get(name);
   if (root === undefined) return;
+  redrawVisibility(root);
+}
 
+// Draw a resource and everything under it as visible or not, as `isVisible` now says.
+function redrawVisibility(root) {
   const touched = new Set();
   const walk = (index) => {
     const placement = placementOf[index];
@@ -442,6 +447,29 @@ export function reattach(name, parentName, placed) {
       rotation: { x: euler.x / DEG, y: euler.y / DEG, z: euler.z / DEG },
     },
   ]);
+}
+
+/**
+ * Take a tip out of the scene at the bottom of a drop into the waste: let go of where it stands and
+ * drawn nowhere from then on. The model takes it out of its tree once the command has run; the next
+ * scene, built from that tree, has it no more.
+ *
+ * @param {string | null} name the tip, or null when the model does not know it (a replay)
+ * @param {string | null} [holder] the shaft that let go of it: with no tip of that name, whatever
+ *   the page has on it is discarded
+ */
+export function discard(name, holder) {
+  let names = [];
+  if (name !== null && name !== undefined && world.indexOfName.has(name)) names = [name];
+  else {
+    const at = holder === null || holder === undefined ? undefined : world.indexOfName.get(holder);
+    if (at !== undefined) names = world.childrenOf[at].map((child) => world.names[child]);
+  }
+  for (const each of names) {
+    reattach(each, null);
+    discardedNames.add(each);
+    redrawVisibility(world.indexOfName.get(each));
+  }
 }
 
 /**

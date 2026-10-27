@@ -13,8 +13,8 @@
 import * as THREE from "three";
 
 import { heldAt, LIDDABLE, MOVABLE, SITES, siteUnder } from "./carry.js";
-import { worldBox } from "./drawn.js";
-import { readAxis, reattach, setAxis, turnTo } from "./live.js";
+import { discardedNames, worldBox } from "./drawn.js";
+import { discard, readAxis, reattach, setAxis, turnTo } from "./live.js";
 import { createPlayer } from "./motion_player.js";
 import { modelOf, world } from "./world.js";
 
@@ -72,6 +72,7 @@ const player = createPlayer({
   setAxis,
   indexOf: (name) => world?.indexOfName.get(name),
   attach: reattach,
+  discard,
   turnTo,
   grip,
   release,
@@ -91,6 +92,7 @@ export const stepMotion = (delta) => player.step(delta);
 export function dropMotions() {
   player.dropAll();
   held.clear();
+  discardedNames.clear();
 }
 
 document.addEventListener("visibilitychange", () => {

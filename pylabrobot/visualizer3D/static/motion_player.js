@@ -7,7 +7,8 @@
 // command as: across, with the arm and the channels moving at once, the channels setting off one
 // after another (the ripple); down onto the targets, a tip pick-up pressing the last stretch
 // slowly; back up. Before it, anything below the traverse height rises to it; at the bottom, tips
-// change hands and an aspiration dwells, then leaves the liquid at its own swap speed. A command
+// change hands - a tip dropped in the waste leaves the scene - and an aspiration or a dispense
+// dwells, then leaves the liquid at its own swap speed. A command
 // that only moves one axis plays that one move.
 //
 // An iSWAP command moves its drives at once: the head along Y or Z, the two joints turning about
@@ -52,6 +53,8 @@ export function turnedLocation(location, from, to, pivot) {
  * @param {(name: string) => number | undefined} deps.indexOf  a resource by name
  * @param {(name: string, parent: string | null, placed?: any) => void} deps.attach  hand a tip
  *   to a new holder, at `placed` ({location, rotation}) when given, else where it stands
+ * @param {(name: string | null, holder: string | null) => void} [deps.discard]  take a tip let go
+ *   of in the waste out of the scene: `name`, or whatever `holder` carries when it is null
  * @param {() => boolean} deps.skipping  whether to jump to the end rather than play
  * @param {(index: number, degrees: number, pivot: any) => void} [deps.turnTo]  turn about a pivot
  * @param {(gripper: string, point: any) => void} [deps.grip]  take hold of what is at `point`
@@ -62,6 +65,7 @@ export function createPlayer({
   setAxis,
   indexOf,
   attach,
+  discard = () => {},
   skipping,
   turnTo = () => {},
   grip = () => {},
@@ -212,7 +216,12 @@ export function createPlayer({
             // the model will have it - a tip pressed onto its shaft, or settling in its spot - at the
             // pace of the Z drive, while whatever the command does at the bottom takes its time.
             const seating = [];
-            for (const { name, parent, location } of handovers) {
+            for (const { name, parent, location, holder, discard: discarded } of handovers) {
+              // Let go of in the waste: out of the model's tree, and out of the scene, here.
+              if (discarded) {
+                discard(name ?? null, holder ?? null);
+                continue;
+              }
               attach(name, parent ?? null);
               const index = indexOf(name);
               if (!location || index === undefined) continue;

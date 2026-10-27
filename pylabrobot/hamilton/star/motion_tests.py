@@ -327,6 +327,30 @@ class DecoderTests(unittest.IsolatedAsyncioTestCase):
     self.assertGreater(following["follow_speed"], 0.0)
     self.assertNotIn("follow", plain["channels"][0])
 
+  async def test_a_tip_dropped_in_the_waste_is_discarded_at_the_bottom(self):
+    """Handed to nothing, the page left the tip standing where it was let go of; the model takes it
+    out of the tree, and the page has to as well."""
+    spots = [self.rack.get_item(f"{row}11") for row in "AB"]
+    tips = [spot.tip for spot in spots]
+    shafts = [c.children[0].name for c in self.star.pipettes.resources[:2]]
+    await self.star.pipettes.pick_up_tips(spots)
+    sent = await self._sent("C0TR")
+    self.requests.clear()
+    await self.star.pipettes.discard_tips()
+    drop = next(r for r in self.requests if r["kind"] == "tip_drop")
+    self.assertEqual(
+      [(a["name"], a["holder"], a["parent"], a.get("discard")) for a in drop["attach"]],
+      [(t.name, s, None, True) for t, s in zip(tips, shafts)],
+    )
+    # A replay sends the firmware raw, so the model never has the tips on the shafts: the page is
+    # still told to discard whatever the shafts carry.
+    again = star_motion(self.star.driver, "C0", "TR", sent[-1])
+    assert again is not None
+    self.assertEqual(
+      [(a["name"], a["holder"], a.get("discard")) for a in again["attach"]],
+      [(None, s, True) for s in shafts],
+    )
+
   async def test_a_read_moves_nothing(self):
     self.assertIsNone(star_motion(self.star.driver, "C0", "RY", {}))
     self.assertIsNone(star_motion(self.star.driver, "C0", "XX", {}))
@@ -427,6 +451,7 @@ class FakePage:
     self.viewer = viewer
     self.delay = delay  # None: never says it is done
     self.events: List[str] = []
+    self.scenes: List[Dict[str, Any]] = []
     self._socket: Any = None
     self._task: Optional["asyncio.Task[None]"] = None
 
@@ -444,6 +469,8 @@ class FakePage:
         parsed = json.loads(message)
         kind, data = parsed["event"], parsed["data"]
         self.events.append(kind)
+        if kind == "scene":
+          self.scenes.append(data)
         if kind == "state" and data.get("locations"):
           self.events.append("locations")
           self.events.extend(f"at:{name}" for name in data["locations"])
@@ -530,6 +557,22 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
     between = page.events[motions[0] + 1 : motions[-1]]
     # The pick-up took a tip onto a shaft, a change of shape, which carries the positions with it.
     self.assertIn("moves", between, f"the pick-up reached the page too late: {page.events}")
+
+  async def test_a_tip_discarded_in_the_waste_leaves_the_scene(self):
+    """The page discards it at the bottom of the stroke; the scene it is sent next has no such tip
+    either, so a page that missed the motion drops it too."""
+    page = await self.page(0.01)
+    spots = [self.rack.get_item(f"{row}12") for row in "AB"]
+    names = {spot.tip.name for spot in spots}
+    await self.star.pipettes.pick_up_tips(spots)
+    before = len(page.scenes)
+    await self.star.pipettes.discard_tips()
+    for _ in range(100):
+      if len(page.scenes) > before:
+        break
+      await asyncio.sleep(0.02)
+    self.assertGreater(len(page.scenes), before, page.events)
+    self.assertFalse(names & set(page.scenes[-1]["instances"]["names"]))
 
 
 class ISWAPDecoderTests(unittest.IsolatedAsyncioTestCase):
