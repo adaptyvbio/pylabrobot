@@ -154,7 +154,7 @@ function sceneBounds() {
 const frame = (direction) => frameBox(sceneBounds(), direction ?? VIEWS.iso);
 
 function goToStartView() {
-  setProjection(startViewName === "iso" ? "perspective" : "orthographic");
+  setProjection(startViewName === "top" || startViewName === "front" ? "orthographic" : "perspective");
   frame(startView);
 }
 

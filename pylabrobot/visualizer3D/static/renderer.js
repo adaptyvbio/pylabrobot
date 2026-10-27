@@ -116,6 +116,8 @@ export function mmPerPixel() {
 
 export const VIEWS = {
   iso: new THREE.Vector3(-0.7, -1, 0.85),
+  // Mostly from the front, a little from above and from the left: the operator's angle on the deck.
+  operator: new THREE.Vector3(-0.3, -1, 0.45),
   top: new THREE.Vector3(0, -0.001, 1),
   front: new THREE.Vector3(0, -1, 0.12),
 };
@@ -264,10 +266,11 @@ export function dolly(factor) {
   controls.update();
 }
 
-// A plan view is what a deck is read in, so that is where the viewer opens. `?view=iso` or
-// `?view=front` picks another, so a link can still point at a particular angle.
-export const startViewName = new URLSearchParams(location.search).get("view") ?? "top";
-export const startView = VIEWS[startViewName] ?? VIEWS.top;
+// The viewer opens on the operator's angle: mostly front-on, slightly from above and the left, so the
+// channels' up-and-down motion reads at a glance. `?view=top`, `?view=front` or `?view=iso` picks
+// another, so a link can still point at a particular angle.
+export const startViewName = new URLSearchParams(location.search).get("view") ?? "operator";
+export const startView = VIEWS[startViewName] ?? VIEWS.operator;
 
 let sizedTo = { w: 0, h: 0 };
 
