@@ -258,6 +258,75 @@ class DecoderTests(unittest.IsolatedAsyncioTestCase):
     self.assertGreater(following["follow_speed"], 0.0)
     self.assertAlmostEqual(following["pull_out"] - following["leave"], 10.0, places=2)
 
+  async def _sent(self, key: str) -> List[Dict[str, Any]]:
+    """Keep the parameters of every `key` command the driver sends from now on."""
+    sent: List[Dict[str, Any]] = []
+    listen = self.star.driver.motion_listener
+
+    async def keep(module: str, command: str, params: Dict[str, Any]) -> None:
+      if module + command == key:
+        sent.append(dict(params))
+      await listen(module, command, params)
+
+    self.star.driver.motion_listener = keep
+    return sent
+
+  async def test_a_dispense_goes_down_dwells_for_its_volume_and_comes_up(self):
+    """Not read, a dispense moved nothing: the page jumped to its end, straight after the
+    aspiration, and the pair looked as if it happened at once."""
+    destination = self.star.deck.get_resource("destination_0")
+    assert isinstance(destination, Plate)
+    spots = [self.rack.get_item(f"{row}8") for row in "AB"]
+    await self.star.pipettes.pick_up_tips(spots)
+    await self.star.pipettes.aspirate([self.source.get_item(f"{r}8") for r in "AB"], [80.0, 40.0])
+    sent = await self._sent("C0DS")
+    self.requests.clear()
+    await self.star.pipettes.dispense(
+      [destination.get_item(f"{r}8") for r in "AB"], [80.0, 40.0], flow_rates=[100.0, 20.0]
+    )
+    dispenses = [r for r in self.requests if r["kind"] == "dispense"]
+    self.assertEqual(len(dispenses), 1, [r["kind"] for r in self.requests])
+    request, params = dispenses[0], sent[-1]
+    self.assert_ends_where_the_model_is(request)
+    for channel, traverse in zip(request["channels"][:2], request["traverse"]):
+      self.assertLess(channel["down"], traverse["z"], "down from traverse height")
+      self.assertLess(channel["down"], channel["end"], "back up at the end")
+    # As long as the slowest channel takes to push its volume out at its flow rate, and settle.
+    volumes, speeds = [int(v) / 10 for v in params["dv"]], [int(v) / 10 for v in params["ds"]]
+    settling = [int(v) / 10 for v in params["wt"]]
+    expected = max(v / s + w for v, s, w in zip(volumes, speeds, settling))
+    self.assertGreater(expected, 1.5)  # the 20 uL/s channel: about 2 s
+    self.assertAlmostEqual(request["dwell"], expected, places=2)
+    self.assertEqual(request["fixed"], motion.DISPENSE_FIXED)
+    # Out of the liquid at the swap speed, then up by the pull-out distance.
+    first = request["channels"][0]
+    self.assertEqual(first["leave_speed"], int(params["de"][0]) / 10)
+    self.assertAlmostEqual(first["pull_out"] - first["leave"], int(params["po"][0]) / 10, places=2)
+
+  async def test_a_dispense_mixes_and_follows_the_rising_surface(self):
+    await self.star.pipettes.pick_up_tips([self.rack.get_item("A9")])
+    await self.star.pipettes.aspirate([self.source.get_item("A9")], [100.0])
+    sent = await self._sent("C0DS")
+    destination = self.star.deck.get_resource("destination_0")
+    assert isinstance(destination, Plate)
+    await self.star.pipettes.dispense([destination.get_item("A9")], [100.0])
+    params = sent[-1]
+
+    def decoded(**changed: Any) -> Dict[str, Any]:
+      request = star_motion(self.star.driver, "C0", "DS", {**params, **changed})
+      assert request is not None
+      return cast(Dict[str, Any], request)
+
+    plain = decoded(mc=["00"], fp=["0000"])
+    mixed = decoded(mc=["03"], mv=["00500"], ms=["0500"], fp=["0000"])
+    # Three cycles of 50 uL each way at 50 uL/s, and a turnaround per cycle.
+    mixing = motion.MIX_VOLUME_TIME_FACTOR * 6.0 + motion.MIX_PER_CYCLE * 3
+    self.assertAlmostEqual(mixed["dwell"] - plain["dwell"], mixing, places=2)
+    following = decoded(fp=["0040"])["channels"][0]
+    self.assertAlmostEqual(following["follow"] - following["down"], 4.0, places=2)
+    self.assertGreater(following["follow_speed"], 0.0)
+    self.assertNotIn("follow", plain["channels"][0])
+
   async def test_a_read_moves_nothing(self):
     self.assertIsNone(star_motion(self.star.driver, "C0", "RY", {}))
     self.assertIsNone(star_motion(self.star.driver, "C0", "XX", {}))

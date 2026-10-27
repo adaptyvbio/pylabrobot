@@ -90,6 +90,21 @@ Known divergences from the device (to do):
 - In the demo's aspirate (PLR's defaults), PLR sent the minimum height `zx` equal to the surface `zl`, so the tip went no deeper than the surface and could follow nowhere, whatever `ip` and `fp` said. Worth checking how PLR sets `zx` upstream.
 - In v1, LLD is **never** done inside `C0AS`: capacitive/pressure searches run first as their own commands (see `Px ZL` / `Px ZE`, section 5), and `C0AS` goes with LLD off (PR [#1362](https://github.com/PyLabRobot/pylabrobot/pull/1362)). So `C0AS` itself needs no search phase.
 
+### `C0 DS` — dispense (`Pipettes.dispense`)
+Profile: **stroke with dwell and leave**, as `C0 AS`.
+
+| Phase | Target | Tag | Source |
+|---|---|---|---|
+| 1–2 | As `C0 TP` | FW + SIM | |
+| 0. Fixed | 1.879 s (`DISPENSE_FIXED`), before anything moves | HEUR | No fixed time of `C0 DS` is fitted (8.6). Taken as `C0 AS`'s constant part, without its transport-air term: a dispense draws no transport air at the flow rate. The traces give only the median duration, 5.00 s against `C0 AS`'s 6.41 s (8.3). A robot's timing profile (`plr_runtime.hamilton.timing`) corrects it per robot once its recordings carry dispenses. |
+| 3. Down | max(`zl` ∓ `ip`, `zx`), as `C0 AS`, in every dispensing mode (`dm`): a jet goes to the heights the command gives | FW | The same fields as `C0 AS` (legacy's `STARBackend.dispense_pip` docstring). |
+| 4. Dwell | Longest channel of (`dv` / `ds`) + `wt` + mixing (`mv`, `mc`, `ms`, as `C0 AS`); while the volume is pushed out, each tip follows the rising surface up by `fp` at a steady pace | FW + FIT | `fp` "how far each tip follows the rising surface" (PLR's `_dispense_in_one_move` docstring). Volume time enters the full `C0 DS` model with slope 0.99–1.02 (8.4). Mixing as fitted for `C0 AS` (8.6), by analogy. |
+| 5. Leave | Up to the surface `zl` at the swap speed `de` | FW + HEUR | `de` "speed of leaving the liquid" (PLR's docstring). From the surface the command gives, not the risen one: HEUR. |
+| 5b. Pull-out | On up by `po` from the surface, at the swap speed, before the transport air is drawn | FW + HEUR | `po` "rise before drawing transport air" (PLR's docstring); the speed as `C0 AS` (FIT there). |
+| 6. Up | To `te` | FW | |
+
+Not played: the side touch (`dj`, section 5) and the blow-out, which move no drive the page draws.
+
 ### `C0 JY` — channels to Y positions
 Profile: **single axis (Y)**. Each channel to `yp` (FW), at the Y drive speed (section 0).
 
@@ -381,6 +396,7 @@ The measured duration minus that drawn time is the command's fixed time. It's fi
 | Command | Model (FIT) | n | R² of the fixed time | RMS | AIC | BIC | Constant only: RMS / AIC | Whole-duration R², median miss |
 |---|---|---|---|---|---|---|---|---|
 | `C0 AS` | 1.879 s + 0.979 × mix volume time + 0.557 s × mix cycles + 6.761 × transport-air time | 228,477 | 0.641 | 521 ms | −297,806 | −297,765 | 870 ms / −63,563 | 0.912, 65 ms |
+| `C0 DS` | 1.879 s, `C0 AS`'s constant part (HEUR, by analogy; not fitted), plus mixing in the dwell as `C0 AS` | — | — | — | — | — | — | — |
 | `C0 TP` | 4.421 s, played as a 4.356 s hold at the bottom after 0.065 s of command handling (placement HEUR), **plus the press drawn as motion** (0.0871 s/mm of `tp − tz`) and the descent setting off at 82% of the crossing (both below) | 48,304 | 0.830 | 38 ms | −316,189 | −316,172 | 94 ms / −228,685 | ≈0.84, — |
 | `C0 TR` | 5.009 s (mean; channels add 0.21 s each, R² 0.15, but 7 against 8 channels is also one protocol against the others: left out), played as a 4.944 s hold at the bottom while the tips are pushed off, after 0.065 s of command handling (placement HEUR) | 54,290 | 0.000 | 176 ms | −188,805 | −188,797 | same | ≈0.61, — |
 | `C0 ZA` | 0.14 s (median of 1,783; the channels were mostly already up) | 1,783 | — | — | — | — | — |

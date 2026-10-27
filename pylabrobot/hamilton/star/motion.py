@@ -19,8 +19,9 @@ speed; the slow press of a tip pick-up; and each command's fixed time.
 - The stroke of a tip command is the one the simulator records (`_record_tip_command`): across, with
   the arm and the channels moving at once, down onto the spots, and back up. A pick-up presses the
   last stretch, from `tp` to `tz`, slowly.
-- An aspiration dwells for as long as its own volume and flow rate say, plus its settling time and
-  its mixing, and leaves the liquid at its own swap speed.
+- An aspiration or a dispense dwells for as long as its own volume and flow rate say, plus its
+  settling time and its mixing, following the surface down (aspiration) or up (dispense), and
+  leaves the liquid at its own swap speed.
 - Every command also takes a fixed time, beyond the motion: what the traces measure less what the
   page draws, as a function of the command's own parameters where they matter.
 - The 96-head's Y and Z move at the head's own drive defaults (`HeadConfiguration`), or at what a
@@ -91,6 +92,11 @@ ASPIRATE_FIXED_PER_TRANSPORT_AIR_TIME = 6.761  # s per s of transport air at the
 # Mixing happens at the bottom, so it adds to the dwell: its volume time, and a turnaround per cycle.
 MIX_VOLUME_TIME_FACTOR = 0.979
 MIX_PER_CYCLE = 0.557  # s
+# A dispense's fixed time has not been fitted (MOTION_PROFILES.md 8.6 has none: the traces give
+# only its median duration, 5.00 s against an aspiration's 6.41 s, 8.3). Taken as an aspiration's
+# constant part, played as a pause before the motion (HEUR, by analogy: the same stroke, with no
+# transport air drawn at the flow rate). Its mixing adds to the dwell, as an aspiration's does.
+DISPENSE_FIXED = ASPIRATE_FIXED  # s
 TIP_PICKUP_FIXED = 4.421  # s: the tip clamped and checked, beyond the drawn motion
 # Held at the bottom, the tip on the shaft, all but a simple command's handling (as a drop's, HEUR).
 TIP_PICKUP_HOLD = TIP_PICKUP_FIXED - 0.065  # s
@@ -617,50 +623,85 @@ def _core_plate(frames: _Frames, command: str, params: Dict[str, Any], kind: str
   )
 
 
-def _aspirate(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+class _PerChannel:
+  """A liquid command's per-channel lists, which run over the channels involved, in order."""
+
+  def __init__(self, params: Dict[str, Any], involved: List[int]):
+    self.params = params
+    self.involved = involved
+
+  def tenths(self, field: str) -> Dict[int, float]:
+    values = _as_list(self.params[field])
+    return {c: _tenths(values[i]) for i, c in enumerate(self.involved)}
+
+  def optional(self, field: str) -> Dict[int, float]:
+    return self.tenths(field) if field in self.params else {c: 0.0 for c in self.involved}
+
+  def raw(self, field: str, default: int = 0) -> Dict[int, int]:
+    values = _as_list(self.params.get(field, [default] * len(self.involved)))
+    return {c: int(values[i]) for i, c in enumerate(self.involved)}
+
+  def mixing(self) -> Dict[int, float]:
+    """How long each channel mixes at the bottom: its volume time, and a turnaround per cycle."""
+    cycles = self.raw("mc")
+    volumes, speeds = self.optional("mv"), self.optional("ms")
+
+    def mixing(c: int) -> float:
+      if not cycles.get(c) or not speeds[c]:
+        return 0.0
+      volume_time = 2 * cycles[c] * volumes[c] / speeds[c]
+      return MIX_VOLUME_TIME_FACTOR * volume_time + MIX_PER_CYCLE * cycles[c]
+
+    return {c: mixing(c) for c in self.involved}
+
+
+def _liquid_stroke(
+  frames: _Frames,
+  kind: str,
+  command: str,
+  params: Dict[str, Any],
+  volume_field: str,
+  speed_field: str,
+  following_sign: float,
+) -> Dict[str, Any]:
+  """`C0 AS` or `C0 DS`: across, down into the liquid, a dwell while the volume moves (following
+  the surface), settling and mixing, out of the liquid at the swap speed, up by the pull-out
+  distance at the same speed, and up to where the command ends.
+
+  `following_sign` is which way the surface moves while the volume does: down (-1) as an
+  aspiration draws, up (+1) as a dispense fills.
+  """
   involved = _involved(_as_list(params["tm"]))
-
-  # Lists other than the positions run over the channels involved, in order.
-  def per_channel(field: str) -> Dict[int, float]:
-    values = _as_list(params[field])
-    return {c: _tenths(values[i]) for i, c in enumerate(involved)}
-
-  def raw(field: str, default: int = 0) -> Dict[int, int]:
-    values = _as_list(params.get(field, [default] * len(involved)))
-    return {c: int(values[i]) for i, c in enumerate(involved)}
-
-  def optional(field: str) -> Dict[int, float]:
-    return per_channel(field) if field in params else {c: 0.0 for c in involved}
-
-  surface = per_channel("zl")
-  floor = per_channel("zx")
-  swap_speed = per_channel("de")
+  fields = _PerChannel(params, involved)
+  surface = fields.tenths("zl")
+  floor = fields.tenths("zx")
+  swap_speed = fields.tenths("de")
   # Into the liquid by the immersion depth, or above it when the direction says so (`it` 1); never
   # below the lowest the command allows.
-  direction = raw("it")
-  immersion = optional("ip")
+  direction = fields.raw("it")
+  immersion = fields.optional("ip")
   down = {
     c: max(surface[c] + (immersion[c] if direction[c] == 1 else -immersion[c]), floor[c])
     for c in involved
   }
-  # While it draws, the tip follows the sinking surface down by `fp`, at a steady pace over the
-  # time the volume takes. The narrower lower section `zu`/`zr` changes that pace on the device in
-  # a way the driver does not document, so it is not drawn.
-  following = optional("fp")
-  volumes, speeds = per_channel("av"), per_channel("as_")
-  draw_time = {c: volumes[c] / speeds[c] if speeds[c] else 0.0 for c in involved}
-  followed = {c: max(down[c] - following[c], floor[c]) for c in involved}
+  # While the volume moves, the tip follows the surface by `fp`, at a steady pace over the time the
+  # volume takes. The narrower lower section `zu`/`zr` changes that pace on the device in a way the
+  # driver does not document, so it is not drawn.
+  following = fields.optional("fp")
+  volumes, speeds = fields.tenths(volume_field), fields.tenths(speed_field)
+  volume_time = {c: volumes[c] / speeds[c] if speeds[c] else 0.0 for c in involved}
+  followed = {c: max(down[c] + following_sign * following[c], floor[c]) for c in involved}
   # Out of the liquid at the swap speed, then up by the pull-out distance before the transport air
   # is drawn, at the swap speed too: Venus aspirations otherwise identical take 5.35 s (n 4 against
   # 802) and 4.85 s (n 12 against 3,534) longer with a 10 mm pull-out at 2 mm/s - 10 mm at 2 mm/s.
   # From the surface (HEUR - the driver says only "rise before drawing transport air").
-  pull_out = optional("po")
+  pull_out = fields.optional("po")
 
   def extras(c: int) -> Dict[str, float]:
     extra: Dict[str, float] = {}
-    if followed[c] < down[c] - 0.05 and draw_time[c] > 0:
+    if abs(followed[c] - down[c]) > 0.05 and volume_time[c] > 0:
       extra["follow"] = frames.lowest_point_z(c, followed[c])
-      extra["follow_speed"] = round((down[c] - followed[c]) / draw_time[c], 3)
+      extra["follow_speed"] = round(abs(down[c] - followed[c]) / volume_time[c], 3)
     if swap_speed[c] > 0:
       extra["leave"] = frames.lowest_point_z(c, surface[c])
       extra["leave_speed"] = swap_speed[c]
@@ -670,7 +711,7 @@ def _aspirate(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str
 
   request = _stroke(
     frames,
-    "aspirate",
+    kind,
     command,
     params,
     traverse=_tenths(params["th"]),
@@ -678,23 +719,18 @@ def _aspirate(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str
     end={c: frames.lowest_point_z(c, _tenths(params["te"])) for c in involved},
     extra={c: extras(c) for c in involved},
   )
-  # As long as the slowest channel takes to draw its volume, settle and mix.
-  settle = per_channel("wt")
-  cycles = {c: int(v) for c, v in zip(involved, _as_list(params.get("mc", [0] * len(involved))))}
-  mix_volumes = per_channel("mv") if "mv" in params else {c: 0.0 for c in involved}
-  mix_speeds = per_channel("ms") if "ms" in params else {c: 0.0 for c in involved}
+  # As long as the slowest channel takes to move its volume, settle and mix.
+  settle = fields.tenths("wt")
+  mixing = fields.mixing()
+  request["dwell"] = round(max(volume_time[c] + settle[c] + mixing[c] for c in involved), 2)
+  return request
 
-  def mixing(c: int) -> float:
-    if not cycles.get(c) or not mix_speeds[c]:
-      return 0.0
-    volume_time = 2 * cycles[c] * mix_volumes[c] / mix_speeds[c]
-    return MIX_VOLUME_TIME_FACTOR * volume_time + MIX_PER_CYCLE * cycles[c]
 
-  request["dwell"] = round(
-    max((volumes[c] / speeds[c] if speeds[c] else 0.0) + settle[c] + mixing(c) for c in involved),
-    2,
-  )
-  transport_air = per_channel("ta") if "ta" in params else {c: 0.0 for c in involved}
+def _aspirate(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+  request = _liquid_stroke(frames, "aspirate", command, params, "av", "as_", following_sign=-1.0)
+  involved = _involved(_as_list(params["tm"]))
+  fields = _PerChannel(params, involved)
+  speeds, transport_air = fields.tenths("as_"), fields.optional("ta")
   request["fixed"] = round(
     ASPIRATE_FIXED
     + ASPIRATE_FIXED_PER_TRANSPORT_AIR_TIME
@@ -702,6 +738,14 @@ def _aspirate(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str
     3,
   )
   return request
+
+
+def _dispense(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+  """`C0 DS`: an aspiration's stroke, the volume pushed out at its own flow rate, the tip following
+  the rising surface up. Every dispensing mode (`dm`) goes to the heights the command gives: a jet
+  is sent from above the liquid by its own surface height and immersion. The fixed time is
+  `DISPENSE_FIXED`, in `_FIXED`."""
+  return _liquid_stroke(frames, "dispense", command, params, "dv", "ds", following_sign=1.0)
 
 
 def _move_y(frames: _Frames, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1178,6 +1222,7 @@ _FIXED = {
   "C0ZP": CORE_TOOL_PICKUP_FIXED,
   "C0ZR": CORE_TOOL_RETURN_FIXED,
   "C0ZA": CHANNELS_UP_FIXED,
+  "C0DS": DISPENSE_FIXED,
   "C0EP": HEAD96_TIP_PICKUP_FIXED,
   "C0ER": HEAD96_TIP_DROP_FIXED,
   "C0EA": HEAD96_ASPIRATE_FIXED,
@@ -1222,6 +1267,8 @@ def _decode(
       return _core_plate(frames, key, params, "core_release")
     if key == "C0AS":
       return _aspirate(frames, key, params)
+    if key == "C0DS":
+      return _dispense(frames, key, params)
     if key == "C0JY":
       return _move_y(frames, key, params)
     if key == "C0JZ":

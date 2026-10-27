@@ -484,6 +484,42 @@ test("a tip is handed over where it stands, then seated where the model gives it
   assert.ok(seating.length > 2, "the tip jumped to its seat instead of moving there");
 });
 
+test("a dispense goes down, dwells for its volume, leaves at its swap speed and comes up", async () => {
+  const world = fakeWorld({ arm: [300, 0, 0], ch0: [0, 200, 10] });
+  const dispense = {
+    kind: "dispense",
+    fixed: 1.879,
+    arm: { name: "arm", x: 300 },
+    traverse: [{ name: "ch0", z: 10 }],
+    channels: [
+      {
+        name: "ch0",
+        channel: 0,
+        y: 200,
+        down: -100,
+        leave: -95,
+        leave_speed: 5,
+        pull_out: -85,
+        end: 10,
+      },
+    ],
+    attach: [],
+    dwell: 2.5,
+    drives: DRIVES,
+  };
+  const seconds = await playOut(createPlayer(world.deps()), dispense);
+  const z = (d) => motionProfile(d, DRIVES.z.speed, DRIVES.z.acceleration).duration;
+  const swap = (d) => motionProfile(d, 5, DRIVES.z.acceleration).duration;
+  const expected = 1.879 + z(110) + 2.5 + swap(5) + swap(10) + z(95);
+  assert.ok(Math.abs(seconds - expected) < 0.1, `took ${seconds}, expected ${expected}`);
+  // Down to the bottom, then up through the pull-out stretch steadily, at the swap speed.
+  const zs = world.log.filter((e) => e.name === "ch0" && e.axis === 2).map((e) => e.value);
+  assert.equal(Math.min(...zs), -100);
+  const after = zs.slice(zs.indexOf(-100));
+  assert.ok(after.filter((v) => v > -95 && v < -85).length > 60, "it did not pull out steadily");
+  assert.equal(world.at("ch0")[2], 10);
+});
+
 // -- the jerk-limited profile -----------------------------------------------------------------------
 
 test("an S-curve takes as long as the fitted X-arm model says, short moves and long", () => {
