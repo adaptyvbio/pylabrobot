@@ -475,6 +475,13 @@ function pickPane(which, button) {
 
 treeButton.addEventListener("click", () => pickPane("tree", treeButton));
 
+// `?tree=0` opens the viewer with the facility tree closed: a page that embeds the viewer as one
+// view among others (a runner's 3D tab) shows the deck alone, and the rail button still opens it.
+if (new URLSearchParams(location.search).get("tree") === "0") {
+  sidepanel.classList.add("collapsed");
+  treeButton.classList.remove("active");
+}
+
 searchButton.addEventListener("click", () => pickPane("search", searchButton));
 
 // Matching as the existing visualizer matches: every term of the query must be found, as a
