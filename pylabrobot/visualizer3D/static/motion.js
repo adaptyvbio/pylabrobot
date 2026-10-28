@@ -86,7 +86,20 @@ const player = createPlayer({
 const asked = Number(new URLSearchParams(location.search).get("motion") ?? 1);
 player.setSpeed(Number.isFinite(asked) && asked >= 0 ? asked : 1);
 
-export const stepMotion = (delta) => player.step(delta);
+// Held: motions stand still where they are (their commands wait for them). `?paused=1` opens the
+// viewer held; a page that embeds it (a runner following its own timeline) holds and releases it
+// with `{ type: "plr-viewer", action: "pause" | "resume" }` messages. Only the embedding page is
+// listened to.
+let held_still = new URLSearchParams(location.search).get("paused") === "1";
+window.addEventListener("message", (event) => {
+  if (window.parent === window || event.source !== window.parent) return;
+  const { type, action } = event.data ?? {};
+  if (type !== "plr-viewer") return;
+  if (action === "pause") held_still = true;
+  else if (action === "resume") held_still = false;
+});
+
+export const stepMotion = (delta) => player.step(held_still ? 0 : delta);
 
 /** A new scene: nothing moving carries on, and nothing is held that PyLabRobot does not have. */
 export function dropMotions() {
