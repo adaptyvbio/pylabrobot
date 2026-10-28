@@ -987,6 +987,34 @@ class Viewer3D:
     await asyncio.wait_for(self._models_drawn.wait(), timeout)
     self._models_drawn.clear()
 
+  async def set_root(self, root: Resource) -> None:
+    """Show another tree in the pages already open: a new scene, with no page reloaded.
+
+    A replay that seeks back builds its deck afresh and fast-forwards it unseen; this hands that deck
+    to the pages watching, which keep their camera. The old tree is no longer listened to, and the
+    motions the pages were playing for it are let go.
+
+    Args:
+      root: the tree to show from now on.
+    """
+    self._release_motions()
+    self._unsubscribe(self.root)
+    self.root.deregister_did_assign_resource_callback(self._on_assign)
+    self.root.deregister_did_unassign_resource_callback(self._on_unassign)
+    self.root = root
+    self._subscribe(root)
+    root.register_did_assign_resource_callback(self._on_assign)
+    root.register_did_unassign_resource_callback(self._on_unassign)
+    if self._scene_timer is not None:
+      self._scene_timer.cancel()
+      self._scene_timer = None
+    # Nothing kept from the old tree's scene: the next one is built for this tree.
+    self._scene = None
+    self._scene_payload = None
+    if self._clients:
+      self.rebuilds += 1
+      await self._send_scene_to_all()
+
   async def stop(self) -> None:
     """Close both servers and stop listening to the tree.
 

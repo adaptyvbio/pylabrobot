@@ -676,6 +676,46 @@ class RebuildTests(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(second["models"], first["models"])
 
 
+class SetRootTests(unittest.IsolatedAsyncioTestCase):
+  """Another tree shown in the pages already open (a replay seeking back): a new scene, no reload."""
+
+  async def test_the_open_pages_get_the_new_tree_and_the_old_one_is_let_go(self):
+    old, new = empty_facility(), empty_facility()
+    old.assign_child_resource(
+      Resource(name="old_part", size_x=10, size_y=10, size_z=10), location=Coordinate(0, 0, 0)
+    )
+    new.assign_child_resource(
+      Resource(name="new_part", size_x=10, size_y=10, size_z=10), location=Coordinate(0, 0, 0)
+    )
+    viewer = Viewer3D(old, open_browser=False, fs_port=FS_PORT, ws_port=WS_PORT)
+    await viewer.start()
+    try:
+      async with websockets.connect(
+        viewer.ws_url, origin=Origin(f"http://127.0.0.1:{viewer.fs_port}")
+      ) as ws:
+        first = json.loads(await asyncio.wait_for(ws.recv(), 5))["data"]
+        self.assertIn("old_part", first["instances"]["names"])
+        await viewer.set_root(new)
+        while True:
+          message = json.loads(await asyncio.wait_for(ws.recv(), 5))
+          if message["event"] == "scene":
+            break
+        names = message["data"]["instances"]["names"]
+        self.assertIn("new_part", names)
+        self.assertNotIn("old_part", names)
+        self.assertGreater(message["data"]["epoch"], first["epoch"])
+      self.assertIs(viewer.root, new)
+      # The old tree is no longer listened to: a change there schedules nothing.
+      rebuilds = viewer.rebuilds
+      old.assign_child_resource(
+        Resource(name="late", size_x=10, size_y=10, size_z=10), location=Coordinate(50, 0, 0)
+      )
+      await asyncio.sleep(2 * Viewer3D.SCENE_DEBOUNCE_S)
+      self.assertEqual(viewer.rebuilds, rebuilds)
+    finally:
+      await viewer.stop()
+
+
 class MeshTests(unittest.TestCase):
   """The file server hands out a mesh without the token, so which files it will serve is narrow."""
 
