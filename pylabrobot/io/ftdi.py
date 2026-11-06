@@ -3,9 +3,10 @@ import ctypes
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from io import IOBase
-from typing import Optional, Tuple, cast
+from typing import Literal, Optional, Tuple, Union, cast
 
 from pylabrobot.events import emit_event
+from pylabrobot.io import ftd2xx
 
 try:
   import pylibftdi.driver
@@ -47,8 +48,13 @@ from pylabrobot.io.validation_utils import LOG_LEVEL_IO, align_sequences
 logger = logging.getLogger(__name__)
 
 
+FTDIBackend = Literal["libftdi", "d2xx"]
+
+
 def is_ftdi_transport_error(error: BaseException) -> bool:
-  """Return whether an exception was raised by the optional pylibftdi transport."""
+  """Return whether an exception was raised by an FTDI transport: pylibftdi's or D2XX's."""
+  if isinstance(error, ftd2xx.D2XXError):
+    return True
   if not HAS_PYLIBFTDI:
     return False
   return isinstance(error, FtdiError)
@@ -76,7 +82,14 @@ class FTDICommand(Command):
 
 
 class FTDI(IOBase):
-  """Thin wrapper around pylibftdi with device resolution and logging.
+  """Thin wrapper around an FTDI driver with device resolution and logging.
+
+  Two backends reach the chip:
+  - "libftdi" (the default): pylibftdi over libusb. On Windows the device's driver must first be
+    replaced with WinUSB or libusbK (Zadig).
+  - "d2xx": FTDI's own D2XX driver (`ftd2xx.dll`, or `libftd2xx` on Linux and macOS), through
+    `pylabrobot.io.ftd2xx`. The device keeps the driver vendor software uses, which works again
+    once this io is stopped; one program at a time has the device open. Needs no Python package.
 
   Finds devices based on the following parameters:
   1. device_id - serial number for explicit connection
@@ -89,7 +102,14 @@ class FTDI(IOBase):
     device_id: Device identifier (serial number)
     vid: USB Vendor ID
     pid: USB Product ID
+    interface_select: libftdi only: the chip's interface. Through D2XX, each interface of a
+      multi-interface chip is a device of its own, with its own serial number.
+    usb_address: libftdi only: the device's USB topology path, '<bus>-<port>[.<port>...]'.
+    backend: "libftdi" or "d2xx"; None means "libftdi".
   """
+
+  # Read by methods of objects built without __init__ (test doubles), which use libftdi's paths.
+  _backend: FTDIBackend = "libftdi"
 
   def __init__(
     self,
@@ -99,20 +119,37 @@ class FTDI(IOBase):
     pid: Optional[int] = None,
     interface_select: Optional[int] = None,
     usb_address: Optional[str] = None,
+    backend: Optional[FTDIBackend] = None,
   ):
-    if not HAS_PYLIBFTDI:
+    if backend is None:
+      backend = "libftdi"
+    if backend not in ("libftdi", "d2xx"):
+      raise ValueError(f"backend must be 'libftdi' or 'd2xx', got {backend!r}")
+    if backend == "d2xx":
+      if usb_address is not None:
+        raise ValueError(
+          "usb_address is libftdi-only: through D2XX, select the device by device_id, its serial "
+          "number"
+        )
+      if interface_select is not None:
+        raise ValueError(
+          "interface_select is libftdi-only: through D2XX, each interface is a device of its own; "
+          "pass its serial number as device_id"
+        )
+    elif not HAS_PYLIBFTDI:
       global _FTDI_ERROR
       raise RuntimeError(
         "pylibftdi is not installed. Install with: pip install pylabrobot[ftdi]. "
         f"Import error: {_FTDI_ERROR}"
       )
-    if not HAS_PYUSB:
+    elif not HAS_PYUSB:
       global _PYUSB_ERROR
       raise RuntimeError(
         "pyusb is not installed. Install with: pip install pylabrobot[ftdi]. "
         f"Import error: {_PYUSB_ERROR}"
       )
 
+    self._backend = backend
     self.human_readable_device_name = human_readable_device_name
     self._device_id = device_id
     self._vid = vid
@@ -121,7 +158,7 @@ class FTDI(IOBase):
     self._usb_address = usb_address
 
     # Will be resolved in setup()
-    self._dev: Optional[Device] = None
+    self._dev: Optional[Union["Device", ftd2xx.D2XXDevice]] = None
     self._executor: Optional[ThreadPoolExecutor] = None
     # Bytes off the wire that no read has taken yet, and the read still in flight, if any.
     self._unread = bytearray()
@@ -134,10 +171,68 @@ class FTDI(IOBase):
       )
 
   @property
-  def dev(self) -> "Device":
+  def dev(self) -> Union["Device", ftd2xx.D2XXDevice]:
+    """The open device: a pylibftdi `Device`, or a `D2XXDevice` with the same methods."""
     if self._dev is None:
       raise RuntimeError("Device not initialized. Call setup() first.")
     return self._dev
+
+  @property
+  def backend(self) -> FTDIBackend:
+    """The driver this io reaches the chip through: "libftdi" or "d2xx"."""
+    return self._backend
+
+  def _resolve_d2xx_serial(self) -> str:
+    """Resolve the serial number of the device to open through D2XX.
+
+    `device_id` is opened as given. Otherwise the one device D2XX lists with the given VID/PID is
+    chosen; D2XX lists only devices on FTDI's driver, and one open in another process without its
+    serial number or VID/PID, so it never matches. On Linux and macOS, the VID/PID is registered
+    with libftd2xx first (`ftd2xx.register_vid_pid`), which knows only FTDI's own PIDs otherwise.
+
+    Returns:
+      The serial number of the resolved device.
+    """
+    if self._vid is not None and self._pid is not None:
+      ftd2xx.register_vid_pid(self._vid, self._pid)
+    if self._device_id is not None:
+      return self._device_id
+
+    devices = ftd2xx.list_devices()
+    candidates = [
+      device
+      for device in devices
+      if not device.opened
+      and (self._vid is None or device.vid == self._vid)
+      and (self._pid is None or device.pid == self._pid)
+    ]
+    connected_devices_string = ", ".join(
+      "a device open in another process"
+      if device.opened
+      else f"{device.serial_number} (VID:PID {device.vid:04x}:{device.pid:04x}, "
+      f"{device.description!r})"
+      for device in devices
+    )
+    logger.debug(
+      f"FTDI D2XX device resolution: found {len(candidates)} candidates for "
+      f"VID:PID {self._vid}:{self._pid}: " + connected_devices_string
+    )
+
+    vid_string = f"{self._vid:04x}" if self._vid is not None else "any"
+    pid_string = f"{self._pid:04x}" if self._pid is not None else "any"
+    if len(candidates) == 0:
+      raise RuntimeError(
+        f"No FTDI D2XX devices found with specified criteria: VID:PID {vid_string}:{pid_string}. "
+        "D2XX devices: " + (connected_devices_string or "none")
+      )
+    if len(candidates) > 1:
+      raise RuntimeError(
+        f"Multiple FTDI D2XX devices found with specified criteria: "
+        f"VID:PID {vid_string}:{pid_string}. "
+        "Please specify the device_id parameter explicitly with the serial number of the desired "
+        "device: " + connected_devices_string
+      )
+    return candidates[0].serial_number
 
   def _resolve_device_serial(self) -> str:
     """List connected FTDI devices and resolve which one to connect to based on parameters.
@@ -303,7 +398,11 @@ class FTDI(IOBase):
       self._dev.close()
     self._dev = None
 
-    if self._usb_address is not None:
+    dev: Union["Device", ftd2xx.D2XXDevice]
+    if self._backend == "d2xx":
+      self._device_id = self._resolve_d2xx_serial()
+      dev = ftd2xx.D2XXDevice(self._device_id)
+    elif self._usb_address is not None:
       usb_bus, usb_device_address = self._resolve_device_location()
       self._detach_kernel_driver(usb_bus, usb_device_address)
       self._device_id = self._usb_address
@@ -357,7 +456,7 @@ class FTDI(IOBase):
         self._dev = None
       await loop.run_in_executor(self._executor, self._reattach_kernel_driver)
       self._shutdown_executor()
-      if isinstance(exc, FtdiError):
+      if is_ftdi_transport_error(exc):
         raise RuntimeError(
           f"Failed to open FTDI device for '{self.human_readable_device_name}': {exc}. "
           "Is the device connected? Is it in use by another process? "
@@ -623,6 +722,7 @@ class FTDI(IOBase):
       "vid": self._vid,
       "pid": self._pid,
       "usb_address": self._usb_address,
+      "backend": self._backend,
     }
 
 
