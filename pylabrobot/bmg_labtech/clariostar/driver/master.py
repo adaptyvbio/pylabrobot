@@ -47,7 +47,7 @@ from .features.drawer import Drawer
 from .features.fluorescence import Fluorescence
 from .features.luminescence import Luminescence
 from .features.temperature_controller import TemperatureController
-from .framing import FTDI_HEADER, USB_HOST_ACK
+from .framing import FTDI_HEADER
 from .parameter_table import (
   PARAMETER_TABLE,
   REPLY_OFFSET,
@@ -100,6 +100,13 @@ class CLARIOstarDriver:
   _default_read_timeout: float = 150.0
   # Seconds between status polls while waiting, with a ~38 ms exchange.
   default_poll_interval: float = 0.25
+
+  # The reader's header byte in its frames and packets (`pylabrobot.bmg_labtech.protocol.framing`).
+  _FRAME_HEADER: int = FTDI_HEADER
+  # INIT's parameters, after the family and command bytes.
+  _INIT_PARAMETERS: bytes = b"\x00\x10\x03"
+  # How the link names the reader in its logs and errors.
+  _DEVICE_NAME: str = "BMG CLARIOstar"
 
   _PACKET_READ_TIMEOUT = 1.0  # seconds to wait for the start of an FTDI reply
   # Seconds without new bytes before abandoning a started frame. The longest pause measured
@@ -184,7 +191,7 @@ class CLARIOstarDriver:
     """Build the link ``use_io`` names, to the reader ``device_id`` names or the first found."""
     if self.use_io == "ftdi":
       return FTDI(
-        human_readable_device_name="BMG CLARIOstar",
+        human_readable_device_name=self._DEVICE_NAME,
         device_id=device_id,
         vid=0x0403,
         pid=0xBB68,
@@ -192,7 +199,7 @@ class CLARIOstarDriver:
     return USB(
       id_vendor=0x0483,
       id_product=0xA29A,
-      human_readable_device_name="BMG CLARIOstar",
+      human_readable_device_name=self._DEVICE_NAME,
       serial_number=device_id,
       read_endpoint_address=0x81,
       write_endpoint_address=0x01,
@@ -275,7 +282,7 @@ class CLARIOstarDriver:
         interface.stop()
       interface = BMGFTDIInterface(
         cast(FTDI, self.io),
-        header=FTDI_HEADER,
+        header=self._FRAME_HEADER,
         baudrate=125000,
         packet_read_timeout=self._PACKET_READ_TIMEOUT,
         frame_stall_timeout=self._FRAME_STALL_TIMEOUT,
@@ -312,17 +319,17 @@ class CLARIOstarDriver:
     A message longer than one packet waits for the reader's acknowledgement before its
     continuation packets; a long reply is acknowledged by the host before its continuations.
     """
-    packets = usb_wrap_payload(payload, header=FTDI_HEADER)
+    packets = usb_wrap_payload(payload, header=self._FRAME_HEADER)
     await self._usb.write(packets[0])
     if len(packets) > 1:
       ack = await self._usb_read_packet()
-      if usb_packet_type(ack, header=FTDI_HEADER) != USB_ACK:
+      if usb_packet_type(ack, header=self._FRAME_HEADER) != USB_ACK:
         raise FrameError(f"Expected a USB acknowledgement, got {ack.hex()}")
       for packet in packets[1:]:
         await self._usb.write(packet)
 
     first = await self._usb_read_packet()
-    packet_type = usb_packet_type(first, header=FTDI_HEADER)
+    packet_type = usb_packet_type(first, header=self._FRAME_HEADER)
     if packet_type == USB_SINGLE:
       return bytes(first[USB_HEADER_SIZE:])
     if packet_type != USB_FIRST:
@@ -330,10 +337,10 @@ class CLARIOstarDriver:
 
     total = usb_total_length(first)
     reply = bytearray(first[USB_HEADER_SIZE:])
-    await self._usb.write(USB_HOST_ACK)
+    await self._usb.write(bytes([0x00, self._FRAME_HEADER, USB_ACK, 0x01]))
     while len(reply) < total:
       packet = await self._usb_read_packet()
-      if usb_packet_type(packet, header=FTDI_HEADER) != USB_CONTINUATION:
+      if usb_packet_type(packet, header=self._FRAME_HEADER) != USB_CONTINUATION:
         raise FrameError(f"Expected a USB continuation packet, got {packet.hex()}")
       reply += packet[USB_HEADER_SIZE:]
     return bytes(reply[:total])
@@ -529,7 +536,7 @@ class CLARIOstarDriver:
       reply = await self.send_command(
         self.CommandFamily.INITIALIZE,
         self.Command.INIT,
-        parameters=b"\x00\x10\x03",
+        parameters=self._INIT_PARAMETERS,
         retries=1,
         when_idle=False,
       )
