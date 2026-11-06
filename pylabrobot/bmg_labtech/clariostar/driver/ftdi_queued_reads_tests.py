@@ -397,6 +397,22 @@ class QueuedReadsTests(unittest.IsolatedAsyncioTestCase):
     self.assertIsNone(driver._ftdi._queued_reads)
     self.assertEqual(sorted(libusb.freed), sorted(libusb.allocated))
 
+  async def test_through_d2xx_the_driver_buffers_and_no_transfers_are_queued(self):
+    # FTDI's D2XX driver keeps its own reads pending, and there is no libusb handle under it.
+    io = FakeFTDI()
+    io._backend = "d2xx"
+    io.replies = [STATUS_IDLE]
+    driver = make_driver(io)
+    with patch.object(QueuedReads, "from_device", side_effect=AssertionError("transfers queued")):
+      with self.assertLogs(ftdi_interface_module.logger, "INFO") as logs:
+        await driver._ftdi.setup()
+    self.assertEqual([record.levelname for record in logs.records], ["INFO"])
+    self.assertIn("D2XX", logs.output[0])
+    self.assertIsNone(driver._ftdi._queued_reads)
+    status = await driver.request_status()
+    self.assertFalse(status.busy)
+    self.assertEqual(io.written, [STATUS_QUERY_FRAME])
+
   async def test_a_cancelled_spectrum_leaves_the_reads_running_and_the_link_clean(self):
     # Page 3 at a quarter of its packet times answers the data request; the read is cancelled
     # early in it, the reader sends it to its end, and the drain takes the rest before the STOP.

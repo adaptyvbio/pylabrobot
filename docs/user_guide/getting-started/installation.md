@@ -169,6 +169,18 @@ If you ever wish to switch back from firmware command to use `pyhamilton` or pla
 
 If you get a `usb.core.NoBackendError: No backend available` error, the [PyUSB repository](https://github.com/pyusb/pyusb/) and its FAQ may be helpful.
 
+### FTDI devices without replacing their driver
+
+Devices with an FTDI chip (`pylabrobot.io.FTDI`) can also be reached through FTDI's own D2XX driver, the one their vendor software usually installs, instead of pylibftdi and libusb. On Windows the device then keeps its driver: no Zadig, and the vendor software keeps working. Only one program can have the device open at a time, so close the vendor software before `setup()`, and stop PyLabRobot before using it again.
+
+```python
+from pylabrobot.io.ftdi import FTDI
+
+io = FTDI(human_readable_device_name="CLARIOstar", vid=0x0403, pid=0xBB68, backend="d2xx")
+```
+
+It needs no Python package, only FTDI's [D2XX driver](https://ftdichip.com/drivers/d2xx-drivers/): `ftd2xx.dll` on Windows, `libftd2xx` on Linux and macOS, where the kernel's `ftdi_sio` driver (Linux) or Apple's FTDI driver (macOS) must not hold the device.
+
 If you are still having trouble, please reach out on [discuss.pylabrobot.org](https://discuss.pylabrobot.org).
 
 ## Cytation imager

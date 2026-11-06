@@ -12,9 +12,19 @@ from unittest import mock
 
 from pylabrobot.events import EventBus, use_event_bus
 from pylabrobot.io import capture as capture_module
+from pylabrobot.io import ftd2xx
 from pylabrobot.io import ftdi as ftdi_module
 from pylabrobot.io.capture import CaptureReader, capturer
-from pylabrobot.io.ftdi import FTDI, HAS_PYLIBFTDI, HAS_PYUSB, FTDICommand, FTDIValidator
+from pylabrobot.io.ftd2xx import D2XXError, FTStatus
+from pylabrobot.io.ftd2xx_tests import CLARIOSTAR, FT232R, OPEN_ELSEWHERE, PHERASTAR, FakeFTD2XX
+from pylabrobot.io.ftdi import (
+  FTDI,
+  HAS_PYLIBFTDI,
+  HAS_PYUSB,
+  FTDICommand,
+  FTDIValidator,
+  is_ftdi_transport_error,
+)
 from pylabrobot.io.validation_utils import LOG_LEVEL_IO
 
 
@@ -373,6 +383,152 @@ class FTDIReadlineTests(unittest.IsolatedAsyncioTestCase):
     io = self._ftdi(b"")
     with self.assertRaises(ValueError):
       await io.readline(terminator=b"")
+
+
+class FTDID2XXBackendTests(unittest.IsolatedAsyncioTestCase):
+  """`FTDI(backend="d2xx")` over a fake FTD2XX library, with neither pylibftdi nor pyusb."""
+
+  def setUp(self) -> None:
+    self.library = FakeFTD2XX([PHERASTAR, FT232R])
+    for patcher in (
+      mock.patch.object(ftd2xx, "load_library", return_value=self.library),
+      mock.patch.object(ftdi_module, "HAS_PYLIBFTDI", False),
+      mock.patch.object(ftdi_module, "HAS_PYUSB", False),
+    ):
+      patcher.start()
+      self.addCleanup(patcher.stop)
+
+  async def test_an_io_runs_over_d2xx_without_pylibftdi(self) -> None:
+    io = FTDI(human_readable_device_name="reader", vid=0x0403, pid=0xBB68, backend="d2xx")
+    self.addAsyncCleanup(io.stop)
+    self.assertEqual(io.backend, "d2xx")
+
+    await io.setup()
+    self.assertEqual(io.device_id, "471-0376")
+    await io.set_baudrate(125000)
+    await io.set_line_property(8, 0, 0)
+    await io.set_latency_timer(2)
+    await io.usb_purge_rx_buffer()
+    self.assertEqual(await io.write(b"\x02ping\x0d"), 6)
+    self.library.received += b"\x02pong\x0d"
+    self.assertEqual(await io.read(25), b"\x02pong\x0d")
+    self.library.modem_status = 0x6030
+    self.assertEqual(await io.poll_modem_status(), 0x6030)
+    await io.stop()
+
+    self.assertEqual(
+      self.library.calls,
+      [
+        ("FT_SetVIDPID", 0x0403, 0xBB68),
+        ("FT_CreateDeviceInfoList",),
+        ("FT_GetDeviceInfoDetail", 0),
+        ("FT_GetDeviceInfoDetail", 1),
+        ("FT_OpenEx", b"471-0376", 1),
+        ("FT_SetTimeouts", 5000, 5000),
+        ("FT_SetFlowControl", 0, 0, 0),
+        ("FT_SetBaudRate", 9600),
+        ("FT_SetLatencyTimer", 16),
+        ("FT_SetBaudRate", 125000),
+        ("FT_SetDataCharacteristics", 8, 0, 0),
+        ("FT_SetLatencyTimer", 2),
+        ("FT_Purge", 1),
+        ("FT_Write", b"\x02ping\x0d"),
+        ("FT_GetQueueStatus",),
+        ("FT_Read", 6),
+        ("FT_GetModemStatus",),
+        ("FT_Close",),
+      ],
+    )
+    self.assertEqual(
+      io.serialize(),
+      {
+        "human_readable_device_name": "reader",
+        "device_id": "471-0376",
+        "vid": 0x0403,
+        "pid": 0xBB68,
+        "usb_address": None,
+        "backend": "d2xx",
+      },
+    )
+
+  async def test_a_device_id_is_opened_by_serial_number_without_listing(self) -> None:
+    io = FTDI(human_readable_device_name="reader", device_id="471-0376", backend="d2xx")
+    self.addAsyncCleanup(io.stop)
+    await io.setup()
+    self.assertEqual(self.library.calls[0], ("FT_OpenEx", b"471-0376", 1))
+    self.assertNotIn("FT_CreateDeviceInfoList", [call[0] for call in self.library.calls])
+
+  async def test_the_vid_pid_must_match_exactly_one_device_not_open_elsewhere(self) -> None:
+    cases = [
+      ([FT232R], "No FTDI D2XX devices found.*A50285BI \\(VID:PID 0403:6001"),
+      ([OPEN_ELSEWHERE], "No FTDI D2XX devices found.*a device open in another process"),
+      ([], "No FTDI D2XX devices found.*D2XX devices: none"),
+      ([PHERASTAR, CLARIOSTAR], "Multiple FTDI D2XX devices found.*471-0376.*430-0001"),
+    ]
+    for devices, message in cases:
+      with self.subTest(message=message):
+        self.library.devices = devices
+        io = FTDI(human_readable_device_name="reader", vid=0x0403, pid=0xBB68, backend="d2xx")
+        with self.assertRaisesRegex(RuntimeError, message):
+          await io.setup()
+        self.assertIsNone(io._dev)
+        self.assertIsNone(io._executor)
+        self.assertIsNone(self.library.opened)
+
+  async def test_a_device_that_does_not_open_is_reported_by_name(self) -> None:
+    self.library.failures["FT_OpenEx"] = FTStatus.FT_DEVICE_NOT_OPENED  # open in BMG's software
+    io = FTDI(human_readable_device_name="reader", device_id="471-0376", backend="d2xx")
+    with self.assertRaisesRegex(RuntimeError, "Failed to open FTDI device for 'reader'") as raised:
+      await io.setup()
+    self.assertIsInstance(raised.exception.__cause__, D2XXError)
+    self.assertIsNone(io._dev)
+    self.assertIsNone(io._executor)
+
+  def test_libftdi_only_arguments_and_unknown_backends_are_refused(self) -> None:
+    with self.assertRaisesRegex(ValueError, "usb_address is libftdi-only"):
+      FTDI(human_readable_device_name="reader", usb_address="1-2", backend="d2xx")
+    with self.assertRaisesRegex(ValueError, "interface_select is libftdi-only"):
+      FTDI(human_readable_device_name="reader", interface_select=1, backend="d2xx")
+    with self.assertRaisesRegex(ValueError, "backend must be"):
+      FTDI(human_readable_device_name="reader", backend="pyftdi")  # type: ignore[arg-type]
+
+  def test_d2xx_errors_are_ftdi_transport_errors(self) -> None:
+    self.assertTrue(is_ftdi_transport_error(D2XXError("FT_Read", FTStatus.FT_IO_ERROR)))
+    self.assertFalse(is_ftdi_transport_error(RuntimeError("not a transport error")))
+
+
+class FTDIDefaultBackendTests(unittest.TestCase):
+  """With no backend given, `FTDI` is what it was: pylibftdi over libusb."""
+
+  def test_the_default_backend_needs_pylibftdi(self) -> None:
+    with (
+      mock.patch.object(ftdi_module, "HAS_PYLIBFTDI", False),
+      mock.patch.object(ftdi_module, "_FTDI_ERROR", ImportError("absent"), create=True),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "pylibftdi is not installed"):
+        FTDI(human_readable_device_name="reader")
+      with self.assertRaisesRegex(RuntimeError, "pylibftdi is not installed"):
+        FTDI(human_readable_device_name="reader", backend=None)
+
+  def test_the_default_backend_opens_a_pylibftdi_device_and_never_d2xx(self) -> None:
+    device_class = mock.Mock()
+    with (
+      mock.patch.object(ftdi_module, "HAS_PYLIBFTDI", True),
+      mock.patch.object(ftdi_module, "HAS_PYUSB", True),
+      mock.patch.object(ftdi_module, "Device", device_class, create=True),
+      mock.patch.object(ftd2xx, "load_library", side_effect=AssertionError("D2XX loaded")),
+    ):
+      io = FTDI(human_readable_device_name="reader", device_id="S1")
+      self.assertEqual(io.backend, "libftdi")
+      self.assertEqual(io.serialize()["backend"], "libftdi")
+      with mock.patch.object(io, "_resolve_device_serial", return_value="S1"):
+        io._setup_sync()
+
+    device_class.assert_called_once_with(
+      lazy_open=True, device_id="S1", pid=None, vid=None, interface_select=None
+    )
+    device_class.return_value.open.assert_called_once_with()
+    self.assertIs(io._dev, device_class.return_value)
 
 
 if __name__ == "__main__":

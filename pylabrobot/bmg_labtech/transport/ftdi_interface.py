@@ -2,7 +2,8 @@
 
 The reply ends where its size field says (CR also occurs inside payloads). Replies are read
 through bulk-in transfers kept pending from `setup` to `stop` (`ftdi_queued_reads`), or with
-libftdi when those cannot run.
+libftdi when those cannot run. Through FTDI's D2XX driver (`FTDI(backend="d2xx")`), the driver
+keeps its own reads pending, and replies are read from its buffer.
 """
 
 import asyncio
@@ -56,16 +57,21 @@ class BMGFTDIInterface:
     self._packet_read_timeout = packet_read_timeout
     self._frame_stall_timeout = frame_stall_timeout
     self._frame_hard_cap = frame_hard_cap
-    # Bulk-in transfers kept pending from setup to stop; None reads through libftdi.
+    # Bulk-in transfers kept pending from setup to stop; None reads through `FTDI.read`.
     self._queued_reads: Optional[QueuedReads] = None
 
   def _start_queued_reads(self) -> None:
     """Keep bulk-in transfers pending on the open FTDI chip; if they cannot start, read with
     libftdi (`_read_frame`).
 
-    Not while capture or validation is active: their replay needs every read to pass `FTDI.read`.
-    The queued reads belong to the event loop that ran setup.
+    Not through D2XX: FTDI's driver keeps its own reads pending and buffers what the reader sends,
+    so `FTDI.read` loses nothing to a host stall. Not while capture or validation is active: their
+    replay needs every read to pass `FTDI.read`. The queued reads belong to the event loop that ran
+    setup.
     """
+    if self.io.backend == "d2xx":
+      logger.info("FTDI's D2XX driver buffers what the reader sends: reading through it")
+      return
     if get_capture_or_validation_active():
       logger.info("capture or validation active: reading with libftdi")
       return
